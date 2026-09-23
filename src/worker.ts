@@ -37,7 +37,7 @@ export default {
         }
 
         const TRUSTED_TOKEN = '6A5AA1D4EA6540818367A6888D30C3FD';
-        // Note: fetch() with Upgrade: websocket requires https:// URL scheme in Cloudflare Workers
+        // Note: fetch() with Upgrade: websocket requires https:// in Cloudflare Workers
         const wsUrl = `https://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1?TrustedClientToken=${TRUSTED_TOKEN}`;
 
         const resp = await fetch(wsUrl, {
@@ -112,24 +112,30 @@ export default {
               }
             } else if (event.data instanceof ArrayBuffer) {
               const buffer = new Uint8Array(event.data);
-              // Find \r\n\r\n separator (0x0D, 0x0A, 0x0D, 0x0A)
-              let headerEndIndex = -1;
-              for (let i = 0; i < Math.min(buffer.length - 3, 400); i++) {
-                if (
-                  buffer[i] === 13 &&
-                  buffer[i + 1] === 10 &&
-                  buffer[i + 2] === 13 &&
-                  buffer[i + 3] === 10
-                ) {
-                  headerEndIndex = i;
-                  break;
-                }
-              }
-
-              if (headerEndIndex !== -1) {
-                const audioData = buffer.slice(headerEndIndex + 4);
-                if (audioData.length > 0) {
-                  audioChunks.push(audioData);
+              if (buffer.length > 2) {
+                const dataView = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+                const headerLength = dataView.getUint16(0);
+                if (headerLength > 0 && 2 + headerLength < buffer.length) {
+                  const audioData = buffer.slice(2 + headerLength);
+                  if (audioData.length > 0) {
+                    audioChunks.push(audioData);
+                  }
+                } else {
+                  // Fallback: search for \r\n\r\n
+                  for (let i = 0; i < Math.min(buffer.length - 3, 400); i++) {
+                    if (
+                      buffer[i] === 13 &&
+                      buffer[i + 1] === 10 &&
+                      buffer[i + 2] === 13 &&
+                      buffer[i + 3] === 10
+                    ) {
+                      const audioData = buffer.slice(i + 4);
+                      if (audioData.length > 0) {
+                        audioChunks.push(audioData);
+                      }
+                      break;
+                    }
+                  }
                 }
               }
             }
