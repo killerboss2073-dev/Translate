@@ -1,0 +1,6 @@
+{
+  "name": "Translate Tool & Edge TTS Console",
+  "description": "Audio & video transcription, translation, and Edge TTS speech synthesis featuring Myanmar Thiha and Nilar neural voices.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

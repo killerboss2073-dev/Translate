@@ -1,0 +1,60 @@
+@import "tailwindcss";
+
+:root {
+  --bg-void: #0b0e11;
+  --panel: #141920;
+  --panel-raised: #1b222b;
+  --line: #2a323c;
+  --teal: #3ed6b5;
+  --teal-dim: #1f5c4f;
+  --amber: #f2a93b;
+  --amber-dim: #5c4322;
+  --error: #e8604c;
+  --text-hi: #edf2f5;
+  --text-mid: #9aa7b2;
+  --text-low: #5c6672;
+}
+
+body {
+  margin: 0;
+  background:
+    radial-gradient(ellipse 900px 500px at 50% -10%, rgba(62, 214, 181, 0.07), transparent),
+    var(--bg-void);
+  color: var(--text-hi);
+  font-family: 'Inter', 'Noto Sans Myanmar', sans-serif;
+  min-height: 100vh;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: var(--bg-void);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--line);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--teal-dim);
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
+.animate-pulse-dot {
+  animation: pulse-dot 1s ease-in-out infinite;
+}
+
+@keyframes wave-bar {
+  0%, 100% { height: 6px; }
+  50% { height: 32px; }
+}
+
+.wave-bar-anim {
+  animation: wave-bar 1.1s ease-in-out infinite;
+}
