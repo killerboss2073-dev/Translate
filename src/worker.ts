@@ -1,12 +1,12 @@
-// Cloudflare Workers _worker.js entry point
+// Cloudflare Worker entry point
 export default {
-  async fetch(request, env, ctx) {
+  async fetch(request: Request, env: any, ctx: any): Promise<Response> {
     const url = new URL(request.url);
 
     // 1. Text-to-Speech endpoint (Edge TTS)
     if (url.pathname === '/api/tts' && request.method === 'POST') {
       try {
-        const body = await request.json();
+        const body: any = await request.json();
         const {
           text,
           voice = 'my-MM-NilarNeural',
@@ -36,7 +36,7 @@ export default {
           },
         });
 
-        const webSocket = resp.webSocket;
+        const webSocket = (resp as any).webSocket;
         if (!webSocket) {
           return new Response(
             JSON.stringify({ error: 'Failed to establish WebSocket connection with Edge TTS' }),
@@ -73,9 +73,9 @@ export default {
           `X-RequestId:${requestId}\r\nContent-Type:application/ssml+xml\r\nX-Timestamp:${date}Z\r\nPath:ssml\r\n\r\n${ssml}`
         );
 
-        const audioChunks = [];
+        const audioChunks: Uint8Array[] = [];
 
-        await new Promise((resolve, reject) => {
+        await new Promise<void>((resolve, reject) => {
           const timer = setTimeout(() => {
             try {
               webSocket.close();
@@ -83,7 +83,7 @@ export default {
             resolve();
           }, 25000);
 
-          webSocket.addEventListener('message', (event) => {
+          webSocket.addEventListener('message', (event: any) => {
             if (typeof event.data === 'string') {
               if (event.data.includes('Path:turn.end')) {
                 clearTimeout(timer);
@@ -122,7 +122,7 @@ export default {
             resolve();
           });
 
-          webSocket.addEventListener('error', (err) => {
+          webSocket.addEventListener('error', () => {
             clearTimeout(timer);
             resolve();
           });
@@ -155,7 +155,7 @@ export default {
             'Access-Control-Allow-Origin': '*',
           },
         });
-      } catch (err) {
+      } catch (err: any) {
         return new Response(JSON.stringify({ error: err.message || 'TTS Error' }), {
           status: 500,
           headers: { 'Content-Type': 'application/json' },
@@ -175,7 +175,7 @@ export default {
           });
         }
 
-        const numberedList = (batch || []).map((s, idx) => `${idx + 1}. ${s.text}`).join('\n');
+        const numberedList = (batch || []).map((s: any, idx: number) => `${idx + 1}. ${s.text}`).join('\n');
         const prompt = `Translate each numbered line below into ${lang}. Preserve meaning and natural tone; keep it concise like spoken dialogue. Respond with ONLY a raw JSON array of strings, same length and same order as the input, no markdown, no code fences, no numbering in the output strings.\n\n${numberedList}`;
 
         const apiRes = await fetch(
@@ -201,15 +201,15 @@ export default {
           });
         }
 
-        const data = await apiRes.json();
-        const rawText = data?.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('') || '';
+        const data: any = await apiRes.json();
+        const rawText = data?.candidates?.[0]?.content?.parts?.map((p: any) => p.text || '').join('') || '';
         const cleaned = rawText.trim().replace(/^```json/i, '').replace(/^```/, '').replace(/```$/, '').trim();
         const translations = JSON.parse(cleaned);
 
         return new Response(JSON.stringify({ translations }), {
           headers: { 'Content-Type': 'application/json' },
         });
-      } catch (err) {
+      } catch (err: any) {
         return new Response(JSON.stringify({ error: err.message || 'Translation failed' }), {
           status: 500,
           headers: { 'Content-Type': 'application/json' },
