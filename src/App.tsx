@@ -548,13 +548,24 @@ export default function App() {
       }),
     });
 
-    if (!res.ok) {
+    const contentType = res.headers.get('content-type') || '';
+
+    if (!res.ok || !contentType.includes('audio')) {
       let errMsg = 'အသံဖိုင် ဖန်တီးမရပါ';
       try {
-        const data = await res.json();
-        errMsg = data.error || errMsg;
+        const textData = await res.text();
+        try {
+          const json = JSON.parse(textData);
+          errMsg = json.error || errMsg;
+        } catch {
+          if (textData && !textData.includes('<!doctype') && !textData.includes('<html') && textData.length < 200) {
+            errMsg = textData;
+          } else {
+            errMsg = `Server Error (${res.status}): ကျေးဇူးပြု၍ ပြန်လည်ကြိုးစားပါ`;
+          }
+        }
       } catch {
-        errMsg = await res.text();
+        errMsg = `Request failed with status ${res.status}`;
       }
       throw new Error(errMsg);
     }
