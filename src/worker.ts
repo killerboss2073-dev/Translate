@@ -3,6 +3,17 @@ export default {
   async fetch(request: Request, env: any, ctx: any): Promise<Response> {
     const url = new URL(request.url);
 
+    // CORS preflight
+    if (request.method === 'OPTIONS') {
+      return new Response(null, {
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+          'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+        },
+      });
+    }
+
     // 1. Text-to-Speech endpoint (Edge TTS)
     if (url.pathname === '/api/tts' && request.method === 'POST') {
       try {
@@ -18,12 +29,16 @@ export default {
         if (!text || typeof text !== 'string' || !text.trim()) {
           return new Response(JSON.stringify({ error: 'Text is required' }), {
             status: 400,
-            headers: { 'Content-Type': 'application/json' },
+            headers: {
+              'Content-Type': 'application/json',
+              'Access-Control-Allow-Origin': '*',
+            },
           });
         }
 
         const TRUSTED_TOKEN = '6A5AA1D4EA6540818367A6888D30C3FD';
-        const wsUrl = `wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1?TrustedClientToken=${TRUSTED_TOKEN}`;
+        // Note: fetch() with Upgrade: websocket requires https:// URL scheme in Cloudflare Workers
+        const wsUrl = `https://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1?TrustedClientToken=${TRUSTED_TOKEN}`;
 
         const resp = await fetch(wsUrl, {
           headers: {
@@ -42,7 +57,10 @@ export default {
             JSON.stringify({ error: 'Failed to establish WebSocket connection with Edge TTS' }),
             {
               status: 502,
-              headers: { 'Content-Type': 'application/json' },
+              headers: {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*',
+              },
             }
           );
         }
@@ -134,7 +152,10 @@ export default {
             JSON.stringify({ error: 'No audio received from Edge TTS service' }),
             {
               status: 500,
-              headers: { 'Content-Type': 'application/json' },
+              headers: {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*',
+              },
             }
           );
         }
@@ -158,7 +179,10 @@ export default {
       } catch (err: any) {
         return new Response(JSON.stringify({ error: err.message || 'TTS Error' }), {
           status: 500,
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*',
+          },
         });
       }
     }
@@ -171,7 +195,10 @@ export default {
         if (!key) {
           return new Response(JSON.stringify({ error: 'Gemini API key is required' }), {
             status: 400,
-            headers: { 'Content-Type': 'application/json' },
+            headers: {
+              'Content-Type': 'application/json',
+              'Access-Control-Allow-Origin': '*',
+            },
           });
         }
 
@@ -197,7 +224,10 @@ export default {
           const errText = await apiRes.text();
           return new Response(JSON.stringify({ error: `Gemini API error: ${errText}` }), {
             status: apiRes.status,
-            headers: { 'Content-Type': 'application/json' },
+            headers: {
+              'Content-Type': 'application/json',
+              'Access-Control-Allow-Origin': '*',
+            },
           });
         }
 
@@ -207,12 +237,18 @@ export default {
         const translations = JSON.parse(cleaned);
 
         return new Response(JSON.stringify({ translations }), {
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*',
+          },
         });
       } catch (err: any) {
         return new Response(JSON.stringify({ error: err.message || 'Translation failed' }), {
           status: 500,
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*',
+          },
         });
       }
     }

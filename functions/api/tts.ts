@@ -4,12 +4,12 @@ export const onRequestPost = async (context: any) => {
     if (!text || typeof text !== 'string' || !text.trim()) {
       return new Response(JSON.stringify({ error: 'Text is required' }), {
         status: 400,
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
       });
     }
 
     const TRUSTED_TOKEN = '6A5AA1D4EA6540818367A6888D30C3FD';
-    const wsUrl = `wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1?TrustedClientToken=${TRUSTED_TOKEN}`;
+    const wsUrl = `https://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1?TrustedClientToken=${TRUSTED_TOKEN}`;
 
     const resp = await fetch(wsUrl, {
       headers: {
@@ -17,14 +17,16 @@ export const onRequestPost = async (context: any) => {
         Origin: 'chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold',
         'User-Agent':
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0',
+        Pragma: 'no-cache',
+        'Cache-Control': 'no-cache',
       },
     });
 
     const webSocket = (resp as any).webSocket;
     if (!webSocket) {
       return new Response(JSON.stringify({ error: 'Failed to establish WebSocket connection with Edge TTS' }), {
-        status: 500,
-        headers: { 'Content-Type': 'application/json' },
+        status: 502,
+        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
       });
     }
 
@@ -42,7 +44,9 @@ export const onRequestPost = async (context: any) => {
       .trim()
       .replace(/&/g, '&amp;')
       .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;');
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&apos;');
 
     const ssml = `<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='my-MM'><voice name='${voice}'><prosody pitch='${pitch}' rate='${rate}' volume='${volume}'>${safeText}</prosody></voice></speak>`;
 
@@ -53,20 +57,42 @@ export const onRequestPost = async (context: any) => {
     const audioChunks: Uint8Array[] = [];
 
     await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => resolve(), 20000);
+      const timer = setTimeout(() => {
+        try {
+          webSocket.close();
+        } catch {}
+        resolve();
+      }, 25000);
 
       webSocket.addEventListener('message', (event: any) => {
         if (typeof event.data === 'string') {
           if (event.data.includes('Path:turn.end')) {
             clearTimeout(timer);
+            try {
+              webSocket.close();
+            } catch {}
             resolve();
           }
         } else if (event.data instanceof ArrayBuffer) {
           const buffer = new Uint8Array(event.data);
-          const headerString = new TextDecoder().decode(buffer.slice(0, 250));
-          const headerEndIndex = headerString.indexOf('\r\n\r\n');
+          let headerEndIndex = -1;
+          for (let i = 0; i < Math.min(buffer.length - 3, 400); i++) {
+            if (
+              buffer[i] === 13 &&
+              buffer[i + 1] === 10 &&
+              buffer[i + 2] === 13 &&
+              buffer[i + 3] === 10
+            ) {
+              headerEndIndex = i;
+              break;
+            }
+          }
+
           if (headerEndIndex !== -1) {
-            audioChunks.push(buffer.slice(headerEndIndex + 4));
+            const audioData = buffer.slice(headerEndIndex + 4);
+            if (audioData.length > 0) {
+              audioChunks.push(audioData);
+            }
           }
         }
       });
@@ -76,21 +102,17 @@ export const onRequestPost = async (context: any) => {
         resolve();
       });
 
-      webSocket.addEventListener('error', (err: any) => {
+      webSocket.addEventListener('error', () => {
         clearTimeout(timer);
-        reject(err);
+        resolve();
       });
     });
-
-    try {
-      webSocket.close();
-    } catch {}
 
     const totalLength = audioChunks.reduce((acc, c) => acc + c.length, 0);
     if (totalLength === 0) {
       return new Response(JSON.stringify({ error: 'No audio received from Edge TTS service' }), {
         status: 500,
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
       });
     }
 
@@ -106,13 +128,14 @@ export const onRequestPost = async (context: any) => {
         'Content-Type': 'audio/mpeg',
         'Content-Length': String(totalLength),
         'Accept-Ranges': 'bytes',
-        'Cache-Control': 'no-cache',
+        'Cache-Control': 'public, max-age=3600',
+        'Access-Control-Allow-Origin': '*',
       },
     });
   } catch (err: any) {
     return new Response(JSON.stringify({ error: err.message || 'TTS Error' }), {
       status: 500,
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
     });
   }
 };
