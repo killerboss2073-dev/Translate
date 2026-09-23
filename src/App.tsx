@@ -158,7 +158,7 @@ export default function App() {
   // CH.01 Keys & Models
   const [assemblyKey, setAssemblyKey] = useState('');
   const [geminiKey, setGeminiKey] = useState('');
-  const [geminiModel, setGeminiModel] = useState('gemini-2.5-flash');
+  const [geminiModel, setGeminiModel] = useState('gemini-3.8-flash');
   const [customModel, setCustomModel] = useState('');
 
   // CH.02 Source Audio
@@ -789,9 +789,9 @@ export default function App() {
                   onChange={(e) => setGeminiModel(e.target.value)}
                   className="w-full bg-[#0B0E11] border border-[#2A323C] text-[#EDF2F5] px-3 py-2 rounded font-['JetBrains_Mono'] text-xs focus:border-[#3ED6B5] outline-none cursor-pointer"
                 >
-                  <option value="gemini-2.5-flash">Gemini 2.5 Flash (မြန်ဆန်တိကျ)</option>
-                  <option value="gemini-1.5-flash">Gemini 1.5 Flash</option>
-                  <option value="gemini-1.5-pro">Gemini 1.5 Pro</option>
+                  <option value="gemini-3.8-flash">Gemini 3.8 Flash (နောက်ဆုံးပေါ် AI အမြန်ဆုံး)</option>
+                  <option value="gemini-3.7-flash">Gemini 3.7 Flash (တိကျမြန်ဆန်)</option>
+                  <option value="gemini-3.6-flash">Gemini 3.6 Flash (တည်ငြိမ်)</option>
                   <option value="__custom__">Custom Model ID…</option>
                 </select>
               </div>

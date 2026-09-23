@@ -55,7 +55,7 @@ async function startServer() {
   // API Route: Server-side Gemini proxy (optional fallback if user doesn't provide client key)
   app.post('/api/gemini/translate', async (req, res) => {
     try {
-      const { batch, lang, model = 'gemini-2.5-flash', clientKey } = req.body;
+      const { batch, lang, model = 'gemini-3.8-flash', clientKey } = req.body;
       const key = clientKey || process.env.GEMINI_API_KEY;
       if (!key) {
         return res.status(400).json({ error: 'Gemini API key is required' });
