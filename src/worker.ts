@@ -1,4 +1,5 @@
 // Cloudflare Worker entry point
+import { convertNumbersInTextToBurmese } from './utils/burmeseNumbers';
 
 const WIN_EPOCH = 11644473600;
 const S_TO_NS = 1e9;
@@ -103,9 +104,11 @@ export default {
           `Content-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n{"context":{"synthesis":{"audio":{"metadataoptions":{"sentenceBoundaryEnabled":"false","wordBoundaryEnabled":"false"},"outputFormat":"audio-24khz-48kbitrate-mono-mp3"}}}}`
         );
 
+        // Convert numbers (70000, 10000, 7000, 8000, ၇၀၀၀, ၈၀၀၀ etc.) to natural spoken Burmese words
+        const textToSynthesize = convertNumbersInTextToBurmese(text.trim());
+
         // Escape XML for SSML
-        const safeText = text
-          .trim()
+        const safeText = textToSynthesize
           .replace(/&/g, '&amp;')
           .replace(/</g, '&lt;')
           .replace(/>/g, '&gt;')
@@ -236,7 +239,11 @@ export default {
         }
 
         const numberedList = (batch || []).map((s: any, idx: number) => `${idx + 1}. ${s.text}`).join('\n');
-        const prompt = `Translate each numbered line below into ${lang}. Preserve meaning and natural tone; keep it concise like spoken dialogue. Respond with ONLY a raw JSON array of strings, same length and same order as the input, no markdown, no code fences, no numbering in the output strings.\n\n${numberedList}`;
+        const isBurmese = (lang || '').toLowerCase().includes('burmese') || (lang || '').toLowerCase().includes('myanmar');
+        const numberRule = isBurmese
+          ? ' Important Burmese number rule: Always convert large numbers and English digits into natural spoken Burmese number terms (e.g. 70000 or 70,000 -> ၇ သောင်း, 10000 or 10,000 -> ၁ သောင်း, 80000 -> ၈ သောင်း, 7000 or 7,000 -> ၇ ထောင်, 8000 or 8,000 -> ၈ ထောင်, 100000 -> ၁ သိန်း, 1000000 -> ၁၀ သိန်း သို့မဟုတ် ၁ သန်း, 500 -> ၅ ရာ). Do NOT output raw multi-zero English digits like 70000 or 10000 in Burmese text.'
+          : '';
+        const prompt = `Translate each numbered line below into ${lang}. Preserve meaning and natural tone; keep it concise like spoken dialogue.${numberRule} Respond with ONLY a raw JSON array of strings, same length and same order as the input, no markdown, no code fences, no numbering in the output strings.\n\n${numberedList}`;
 
         const apiRes = await fetch(
           `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(key)}`,
@@ -267,7 +274,11 @@ export default {
         const data: any = await apiRes.json();
         const rawText = data?.candidates?.[0]?.content?.parts?.map((p: any) => p.text || '').join('') || '';
         const cleaned = rawText.trim().replace(/^```json/i, '').replace(/^```/, '').replace(/```$/, '').trim();
-        const translations = JSON.parse(cleaned);
+        let translations = JSON.parse(cleaned);
+
+        if (isBurmese && Array.isArray(translations)) {
+          translations = translations.map((t: string) => convertNumbersInTextToBurmese(t));
+        }
 
         return new Response(JSON.stringify({ translations }), {
           headers: {

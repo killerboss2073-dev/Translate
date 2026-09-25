@@ -27,8 +27,17 @@ import {
   ExternalLink,
   MessageCircle,
   HelpCircle,
-  AlertCircle
+  AlertCircle,
+  History,
+  RotateCcw,
+  Search,
+  Clock,
+  ArrowUpRight,
+  Hash,
+  Subtitles
 } from 'lucide-react';
+import { convertNumbersInTextToBurmese, safeParseTranslations } from './utils/burmeseNumbers';
+import { splitIntoBurmeseCues, formatBurmeseTwoLines, fmtSrtTime } from './utils/burmeseSubtitles';
 
 interface Segment {
   id: string;
@@ -39,26 +48,60 @@ interface Segment {
   hasTimestamp: boolean;
 }
 
-const STORAGE_KEY = 'signalpath_settings_v2';
+interface HistoryItem {
+  id: string;
+  timestamp: number;
+  formattedTime: string;
+  sourceText?: string;
+  translatedText: string;
+  targetLang: string;
+  geminiModel: string;
+  voiceId: string;
+  voiceName: string;
+  speed: number;
+  pitch: number;
+  volume: number;
+  audioBase64?: string;
+  hasAudio: boolean;
+  segmentCount?: number;
+  srtContent?: string;
+}
 
-const BURMESE_VOICES = [
+const STORAGE_KEY = 'signalpath_settings_v3';
+const HISTORY_STORAGE_KEY = 'signalpath_history_v3';
+
+const PRIMARY_VOICES = [
   {
     id: 'my-MM-NilarNeural',
     name: 'နီလာ (Nilar)',
     gender: 'Female (အမျိုးသမီး)',
     desc: 'ကြည်လင်ပျော့ပျောင်းသော သဘာဝအမျိုးသမီးအသံ',
-    badge: 'Female',
+    badge: 'Female • မြန်မာ',
+    icon: '👩',
+    speedPreset: 0,
   },
   {
     id: 'my-MM-ThihaNeural',
     name: 'သီဟ (Thiha)',
     gender: 'Male (အမျိုးသား)',
     desc: 'တည်ကြည်ပြတ်သားသော သဘာဝအမျိုးသားအသံ',
-    badge: 'Male',
+    badge: 'Male • မြန်မာ',
+    icon: '👨',
+    speedPreset: 0,
+  },
+  {
+    id: 'it-IT-GiuseppeMultilingualNeural',
+    name: 'မောင်ကျော်သူ (Giuseppe Fast Vibe ⚡ - Speed 1.3)',
+    gender: 'it-IT (Multilingual)',
+    desc: 'ရယ်မောပျော်ရွှင်ဖွယ် သွက်လက်သောအသံ',
+    badge: '⚡ Speed 1.3x • Multilingual',
+    icon: '⚡',
+    speedPreset: 30, // +30% is 1.3x speed
   },
 ];
 
 const OTHER_VOICES = [
+  { id: 'it-IT-GiuseppeMultilingualNeural', name: 'Italian/Multilingual - Giuseppe (မောင်ကျော်သူ ⚡ Fast Vibe)', lang: 'Multilingual' },
   { id: 'en-US-JennyNeural', name: 'English (US) - Jenny (Female)', lang: 'English' },
   { id: 'en-US-GuyNeural', name: 'English (US) - Guy (Male)', lang: 'English' },
   { id: 'th-TH-PremwadeeNeural', name: 'Thai (ไทย) - Premwadee (Female)', lang: 'Thai' },
@@ -76,15 +119,6 @@ function fmtTime(ms: number): string {
     return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
   }
   return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
-}
-
-function fmtSrtTime(ms: number): string {
-  const totalMs = Math.max(0, Math.floor(ms));
-  const h = Math.floor(totalMs / 3600000);
-  const m = Math.floor((totalMs % 3600000) / 60000);
-  const s = Math.floor((totalMs % 60000) / 1000);
-  const msPart = totalMs % 1000;
-  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')},${String(msPart).padStart(3, '0')}`;
 }
 
 function srtTimeToMs(t: string): number {
@@ -130,17 +164,51 @@ function splitTextToSegments(raw: string): Segment[] {
     if (parsed.length > 0) return parsed;
   }
 
-  const lines = raw.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
-  let pieces: string[] = [];
-  if (lines.length > 1) {
-    pieces = lines;
-  } else {
-    const single = lines[0] || '';
-    pieces = single
-      .split(/(?<=[။၊.!?])\s+/)
+  const initialLines = raw.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  const rawPieces: string[] = [];
+
+  for (const line of initialLines) {
+    const splitByPunct = line
+      .split(/(?<=[။!?])|(?<=[.])\s+|(?<=(?:တယ်|ပါ|တာ|လဲ|နော်|ပဲ|လို့|မို့|ပြီး|ဟုတ်|ရယ်|စမ်း|ပါဘူး))\s+/)
       .map(s => s.trim())
       .filter(Boolean);
-    if (pieces.length === 0 && single) pieces = [single];
+    rawPieces.push(...splitByPunct);
+  }
+
+  // Chunk long segments (>140 chars) by commas, clauses, or words so Gemini never skips translation
+  const pieces: string[] = [];
+  const MAX_CHUNK_LEN = 140;
+
+  for (const part of rawPieces) {
+    if (part.length <= MAX_CHUNK_LEN) {
+      pieces.push(part);
+    } else {
+      const subParts = part.split(/(?<=[,၊;:])\s+/).map(s => s.trim()).filter(Boolean);
+      let current = '';
+      for (const sub of subParts) {
+        if ((current + ' ' + sub).trim().length <= MAX_CHUNK_LEN) {
+          current = (current + ' ' + sub).trim();
+        } else {
+          if (current) pieces.push(current);
+          if (sub.length <= MAX_CHUNK_LEN) {
+            current = sub;
+          } else {
+            const words = sub.split(/\s+/);
+            let wCurrent = '';
+            for (const w of words) {
+              if ((wCurrent + ' ' + w).trim().length <= MAX_CHUNK_LEN) {
+                wCurrent = (wCurrent + ' ' + w).trim();
+              } else {
+                if (wCurrent) pieces.push(wCurrent);
+                wCurrent = w;
+              }
+            }
+            current = wCurrent;
+          }
+        }
+      }
+      if (current) pieces.push(current);
+    }
   }
 
   const SPACING_MS = 3000;
@@ -154,11 +222,53 @@ function splitTextToSegments(raw: string): Segment[] {
   }));
 }
 
+function safeBase64ToBlob(base64: string, mimeType = 'audio/mpeg'): Blob {
+  if (!base64) return new Blob([], { type: mimeType });
+  try {
+    const clean = base64.replace(/[\s\r\n]/g, '').replace(/-/g, '+').replace(/_/g, '/');
+    const padded = clean.padEnd(clean.length + ((4 - (clean.length % 4)) % 4), '=');
+    const binary = atob(padded);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return new Blob([bytes.buffer], { type: mimeType });
+  } catch {
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+    const clean = base64.replace(/[^A-Za-z0-9+/]/g, '');
+    const len = clean.length;
+    const bytes: number[] = [];
+    for (let i = 0; i < len; i += 4) {
+      const b1 = chars.indexOf(clean[i]);
+      const b2 = chars.indexOf(clean[i + 1] || 'A');
+      const b3 = chars.indexOf(clean[i + 2] || 'A');
+      const b4 = chars.indexOf(clean[i + 3] || 'A');
+      bytes.push((b1 << 2) | (b2 >> 4));
+      if (clean[i + 2] && clean[i + 2] !== '=') bytes.push(((b2 & 15) << 4) | (b3 >> 2));
+      if (clean[i + 3] && clean[i + 3] !== '=') bytes.push(((b3 & 3) << 6) | b4);
+    }
+    return new Blob([new Uint8Array(bytes)], { type: mimeType });
+  }
+}
+
+function blobToBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      resolve(typeof reader.result === 'string' ? reader.result : '');
+    };
+    reader.onerror = () => {
+      resolve('');
+    };
+    reader.readAsDataURL(blob);
+  });
+}
+
 export default function App() {
   // CH.01 Keys & Models
   const [assemblyKey, setAssemblyKey] = useState('');
   const [geminiKey, setGeminiKey] = useState('');
-  const [geminiModel, setGeminiModel] = useState('gemini-3.8-flash');
+  const [geminiModel, setGeminiModel] = useState('gemini-3.6-flash');
   const [customModel, setCustomModel] = useState('');
 
   // CH.02 Source Audio
@@ -185,7 +295,7 @@ export default function App() {
   const [copiedStatus, setCopiedStatus] = useState(false);
 
   // CH.06 Edge TTS
-  const [ttsVoice, setTtsVoice] = useState<'my-MM-NilarNeural' | 'my-MM-ThihaNeural' | string>('my-MM-NilarNeural');
+  const [ttsVoice, setTtsVoice] = useState<string>('my-MM-NilarNeural');
   const [ttsSourceMode, setTtsSourceMode] = useState<'transcript' | 'custom'>('transcript');
   const [customTtsText, setCustomTtsText] = useState('မင်္ဂလာပါရှင်။ Translate Tool မှ ကြိုဆိုပါတယ်။');
   const [ttsRate, setTtsRate] = useState(0); // -50 to +50 percent
@@ -195,15 +305,27 @@ export default function App() {
   const [ttsErr, setTtsErr] = useState('');
   const [ttsAudioUrl, setTtsAudioUrl] = useState<string | null>(null);
   const [ttsAudioBlob, setTtsAudioBlob] = useState<Blob | null>(null);
+  const [currentTtsSrt, setCurrentTtsSrt] = useState<string>('');
   const [activeSegmentTtsId, setActiveSegmentTtsId] = useState<string | null>(null);
 
-  // Audio player state
+  // Audio player state for main player
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [audioDuration, setAudioDuration] = useState(0);
   const [audioCurrentTime, setAudioCurrentTime] = useState(0);
 
-  // Load saved settings
+  // CH.07 History State
+  const [history, setHistory] = useState<HistoryItem[]>([]);
+  const [historySearch, setHistorySearch] = useState('');
+  const [copiedHistId, setCopiedHistId] = useState<string | null>(null);
+  const [activeHistoryAudioId, setActiveHistoryAudioId] = useState<string | null>(null);
+  const [confirmClearHistory, setConfirmClearHistory] = useState(false);
+  const historyAudioRef = useRef<HTMLAudioElement | null>(null);
+  const [isHistPlaying, setIsHistPlaying] = useState(false);
+  const [histAudioProgress, setHistAudioProgress] = useState(0);
+  const [histAudioDuration, setHistAudioDuration] = useState(0);
+
+  // Load saved settings & history
   useEffect(() => {
     try {
       const saved = localStorage.getItem(STORAGE_KEY);
@@ -216,6 +338,19 @@ export default function App() {
         if (data.targetLang) setTargetLang(data.targetLang);
         if (data.customLang) setCustomLang(data.customLang);
         if (data.ttsVoice) setTtsVoice(data.ttsVoice);
+        if (typeof data.ttsRate === 'number') setTtsRate(data.ttsRate);
+      }
+    } catch {
+      // ignore
+    }
+
+    try {
+      const histSaved = localStorage.getItem(HISTORY_STORAGE_KEY);
+      if (histSaved) {
+        const parsed = JSON.parse(histSaved);
+        if (Array.isArray(parsed)) {
+          setHistory(parsed);
+        }
       }
     } catch {
       // ignore
@@ -233,14 +368,15 @@ export default function App() {
         targetLang,
         customLang,
         ttsVoice,
+        ttsRate,
       };
       localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
     } catch {
       // ignore
     }
-  }, [assemblyKey, geminiKey, geminiModel, customModel, targetLang, customLang, ttsVoice]);
+  }, [assemblyKey, geminiKey, geminiModel, customModel, targetLang, customLang, ttsVoice, ttsRate]);
 
-  // Audio player event listeners
+  // Main Audio player event listeners
   useEffect(() => {
     const audio = audioRef.current;
     if (!audio) return;
@@ -268,6 +404,70 @@ export default function App() {
       audio.removeEventListener('loadedmetadata', onLoadedMetadata);
     };
   }, [ttsAudioUrl]);
+
+  // History Audio player event listeners
+  useEffect(() => {
+    const histAudio = historyAudioRef.current;
+    if (!histAudio) return;
+
+    const onPlay = () => setIsHistPlaying(true);
+    const onPause = () => setIsHistPlaying(false);
+    const onEnded = () => {
+      setIsHistPlaying(false);
+      setHistAudioProgress(0);
+      setActiveHistoryAudioId(null);
+    };
+    const onTimeUpdate = () => setHistAudioProgress(histAudio.currentTime);
+    const onLoadedMetadata = () => setHistAudioDuration(histAudio.duration || 0);
+
+    histAudio.addEventListener('play', onPlay);
+    histAudio.addEventListener('pause', onPause);
+    histAudio.addEventListener('ended', onEnded);
+    histAudio.addEventListener('timeupdate', onTimeUpdate);
+    histAudio.addEventListener('loadedmetadata', onLoadedMetadata);
+
+    return () => {
+      histAudio.removeEventListener('play', onPlay);
+      histAudio.removeEventListener('pause', onPause);
+      histAudio.removeEventListener('ended', onEnded);
+      histAudio.removeEventListener('timeupdate', onTimeUpdate);
+      histAudio.removeEventListener('loadedmetadata', onLoadedMetadata);
+    };
+  }, []);
+
+  // Helper to add item to History
+  const saveToHistory = (item: Omit<HistoryItem, 'id' | 'timestamp' | 'formattedTime'>) => {
+    const now = new Date();
+    const formattedTime = now.toLocaleDateString('en-GB', {
+      day: 'numeric',
+      month: 'short',
+      year: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: true,
+    });
+
+    const newItem: HistoryItem = {
+      ...item,
+      id: 'hist-' + Date.now() + '-' + Math.random().toString(36).substring(2, 6),
+      timestamp: Date.now(),
+      formattedTime,
+    };
+
+    setHistory((prev) => {
+      const updated = [newItem, ...prev.slice(0, 39)];
+      try {
+        localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(updated));
+      } catch {
+        // In case localStorage is full, remove heavy audioBase64 from items older than top 5
+        const lean = updated.map((h, idx) => (idx < 5 ? h : { ...h, audioBase64: undefined }));
+        try {
+          localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(lean));
+        } catch {}
+      }
+      return updated;
+    });
+  };
 
   // Handle file select
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -379,22 +579,26 @@ export default function App() {
         const sentData = await sentRes.json();
         sentences = sentData.sentences || [];
       }
-      if (sentences.length === 0 && pollData.text) {
-        sentences = [{ start: 0, end: pollData.audio_duration ? pollData.audio_duration * 1000 : 0, text: pollData.text }];
+
+      if (sentences.length > 0) {
+        const segs: Segment[] = sentences.map((s: any, idx: number) => ({
+          id: 'seg-' + (idx + 1),
+          start: s.start,
+          end: s.end,
+          text: s.text,
+          translated: null,
+          hasTimestamp: true,
+        }));
+        setSegments(segs);
+      } else if (pollData.text) {
+        const segs = splitTextToSegments(pollData.text);
+        setSegments(segs);
+      } else {
+        throw new Error('စာသား မတွေ့ရှိပါ။');
       }
 
-      const parsedSegs: Segment[] = sentences.map((s, idx) => ({
-        id: `seg-${idx + 1}`,
-        start: s.start,
-        end: s.end,
-        text: s.text,
-        translated: null,
-        hasTimestamp: true,
-      }));
-
-      setSegments(parsedSegs);
       setTransStatus('DONE');
-      setTransProgress(`ပြီးပါပြီ — စာကြောင်းပေါင်း ${parsedSegs.length} ခု ရရှိပါသည်။`);
+      setTransProgress('စာသား အောင်မြင်စွာ ပြောင်းလဲပြီးပါပြီ ✓');
       setTranslateStatus('READY');
     } catch (err: any) {
       setTransStatus('ERROR');
@@ -402,89 +606,181 @@ export default function App() {
     }
   };
 
-  // CH.05 Gemini Translation Helper
-  const currentLangName = targetLang === '__custom__' ? (customLang.trim() || 'Burmese') : targetLang;
-  const currentModelName = geminiModel === '__custom__' ? (customModel.trim() || 'gemini-2.5-flash') : geminiModel;
-
+  // CH.05 Gemini Translation
   const handleTranslate = async () => {
     setTranslateErr('');
     if (segments.length === 0) {
-      setTranslateErr('ဘာသာပြန်ရန် စာသား (Segments) မရှိသေးပါ။ CH.02 သို့မဟုတ် CH.03 တွင် စာသားအရင်ထည့်ပါ။');
+      setTranslateErr('ဘာသာပြန်ရန် Transcript စာကြောင်းများ မရှိသေးပါ။ CH.02 သို့မဟုတ် CH.03 တွင် စာသား အရင်ထည့်ပါ။');
       return;
     }
 
+    const currentLangName = targetLang === '__custom__' ? customLang.trim() || 'Burmese' : targetLang;
+    const modelToUse = geminiModel === '__custom__' ? customModel.trim() || 'gemini-3.6-flash' : geminiModel;
+    const cleanKey = geminiKey.trim().replace(/[\r\n\t\s]/g, '');
+
     setTranslateStatus('TRANSLATING');
-    const BATCH = 15;
-    const updatedSegments = [...segments];
+    setTranslateProgress(`Gemini (${modelToUse}) ဖြင့် ${currentLangName} ဘာသာသို့ ပြန်ဆိုနေပါသည်…`);
 
     try {
-      for (let i = 0; i < updatedSegments.length; i += BATCH) {
-        const batch = updatedSegments.slice(i, i + BATCH);
-        setTranslateProgress(`စာကြောင်း ${i + 1} မှ ${Math.min(i + BATCH, updatedSegments.length)} အထိ ${currentLangName} သို့ ဘာသာပြန်နေပါသည်…`);
+      const BATCH_SIZE = 15;
+      const newSegments = [...segments];
 
-        // Try backend route first
+      for (let i = 0; i < newSegments.length; i += BATCH_SIZE) {
+        const batch = newSegments.slice(i, i + BATCH_SIZE);
+        setTranslateProgress(`စာကြောင်း (${i + 1} မှ ${Math.min(i + BATCH_SIZE, newSegments.length)}) / ${newSegments.length} ဘာသာပြန်နေပါသည်…`);
+
         let translations: string[] = [];
-        try {
-          const res = await fetch('/api/gemini/translate', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              batch,
-              lang: currentLangName,
-              model: currentModelName,
-              clientKey: geminiKey.trim(),
-            }),
-          });
-          if (res.ok) {
-            const data = await res.json();
-            translations = data.translations || [];
-          } else {
-            throw new Error(await res.text());
-          }
-        } catch (backendErr) {
-          // If backend fails or client has direct key, call direct
-          const key = geminiKey.trim();
-          if (!key) throw new Error('Gemini API key is required. Please add your key in CH.01.');
 
-          const numberedList = batch.map((s, idx) => `${idx + 1}. ${s.text}`).join('\n');
-          const prompt = `Translate each numbered line below into ${currentLangName}. Preserve natural tone and spoken nuances. Return ONLY a valid JSON array of strings in the exact same length and order as input.\n\n${numberedList}`;
+        // Server-side route with multi-model fallback and smart retry
+        const res = await fetch('/api/gemini/translate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            batch,
+            lang: currentLangName,
+            model: modelToUse,
+            clientKey: cleanKey || undefined,
+          }),
+        });
 
-          const directRes = await fetch(
-            `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(currentModelName)}:generateContent?key=${encodeURIComponent(key)}`,
-            {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                contents: [{ parts: [{ text: prompt }] }],
-                generationConfig: {
-                  responseMimeType: 'application/json',
-                  maxOutputTokens: 8192,
-                },
-              }),
-            }
-          );
-          if (!directRes.ok) throw new Error(`Gemini Error: ${await directRes.text()}`);
-          const dData = await directRes.json();
-          const rawText = dData?.candidates?.[0]?.content?.parts?.map((p: any) => p.text || '').join('') || '';
-          const cleaned = rawText.trim().replace(/^```json/i, '').replace(/^```/, '').replace(/```$/, '').trim();
-          translations = JSON.parse(cleaned);
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({}));
+          throw new Error(errData.error || `ဘာသာပြန်ဆိုခြင်း မအောင်မြင်ပါ (${res.status})`);
         }
 
-        // Apply translations
+        const data = await res.json();
+        translations = data.translations || [];
+
+        const isBurmese = currentLangName.toLowerCase().includes('burmese') || currentLangName.toLowerCase().includes('myanmar');
+
         for (let j = 0; j < batch.length; j++) {
           if (translations[j]) {
-            updatedSegments[i + j].translated = translations[j];
+            const finalTranslated = isBurmese ? convertNumbersInTextToBurmese(translations[j]) : translations[j];
+            newSegments[i + j].translated = finalTranslated;
           }
         }
-        setSegments([...updatedSegments]);
+
+        setSegments([...newSegments]);
       }
 
       setTranslateStatus('DONE');
       setTranslateProgress(`ဘာသာပြန်ခြင်း ပြီးစီးပါပြီ (${currentLangName}) ✓`);
+
+      // Record translation history
+      const originalJoined = newSegments.map((s) => s.text).filter(Boolean).join(' ');
+      const translatedJoined = newSegments.map((s) => s.translated || s.text).filter(Boolean).join(' ');
+      const voiceObj = PRIMARY_VOICES.find((v) => v.id === ttsVoice) || OTHER_VOICES.find((v) => v.id === ttsVoice);
+      const srtBurmese2Lines = generateBurmeseTwoLineSrt(newSegments, translatedJoined);
+
+      saveToHistory({
+        sourceText: originalJoined,
+        translatedText: translatedJoined,
+        targetLang: currentLangName,
+        geminiModel: modelToUse,
+        voiceId: ttsVoice,
+        voiceName: voiceObj ? voiceObj.name : ttsVoice,
+        speed: ttsRate,
+        pitch: ttsPitch,
+        volume: ttsVolume,
+        hasAudio: false,
+        segmentCount: newSegments.length,
+        srtContent: srtBurmese2Lines,
+      });
     } catch (err: any) {
       setTranslateStatus('ERROR');
       setTranslateErr(err.message || String(err));
     }
+  };
+
+  // Extract exact audio duration in ms using Web Audio API
+  const getExactAudioDurationMs = async (blob: Blob): Promise<number> => {
+    try {
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      if (AudioCtx) {
+        const ctx = new AudioCtx();
+        const arrayBuffer = await blob.arrayBuffer();
+        const decoded = await ctx.decodeAudioData(arrayBuffer.slice(0));
+        ctx.close().catch(() => {});
+        if (decoded && decoded.duration > 0) {
+          return Math.round(decoded.duration * 1000);
+        }
+      }
+    } catch (e) {
+      console.warn('AudioContext decode fallback:', e);
+    }
+    return 0;
+  };
+
+  // Burmese 2-line SRT generator for transcript segments or fallback
+  const generateBurmeseTwoLineSrt = (
+    segs: Segment[],
+    fallbackTranslated?: string,
+    totalDurationMs?: number
+  ): string => {
+    // 1. If generated from custom text / text input or TTS audio with known duration
+    const raw = convertNumbersInTextToBurmese((fallbackTranslated || '').trim());
+    if (raw) {
+      const pieces = splitIntoBurmeseCues(raw);
+      const cueTwoLineTexts = pieces
+        .map((p) => formatBurmeseTwoLines(p))
+        .filter((t) => t.trim().length > 0);
+
+      if (cueTwoLineTexts.length > 0) {
+        let currentStart = 0;
+        const dur = totalDurationMs && totalDurationMs > 500 ? totalDurationMs : cueTwoLineTexts.length * 3200;
+        const totalChars = cueTwoLineTexts.reduce((acc, c) => acc + c.replace(/\s+/g, '').length, 0) || 1;
+
+        return cueTwoLineTexts
+          .map((twoLines, idx) => {
+            const cueChars = twoLines.replace(/\s+/g, '').length || 1;
+            const cueDuration = Math.round((cueChars / totalChars) * dur);
+            const start = currentStart;
+            const isLast = idx === cueTwoLineTexts.length - 1;
+            const end = isLast ? Math.max(start + 400, Math.round(dur)) : start + Math.max(400, cueDuration);
+            currentStart = end;
+            return `${idx + 1}\n${fmtSrtTime(start)} --> ${fmtSrtTime(end)}\n${twoLines}\n`;
+          })
+          .join('\n');
+      }
+    }
+
+    // 2. If we have original video transcription segments (CH.04 / CH.05)
+    if (segs && segs.length > 0) {
+      const cues: Array<{ start: number; end: number; text: string }> = [];
+
+      segs.forEach((s) => {
+        const rawText = (s.translated || s.text || '').trim();
+        if (!rawText) return;
+        const spokenText = convertNumbersInTextToBurmese(rawText);
+        const shortPieces = splitIntoBurmeseCues(spokenText);
+
+        if (shortPieces.length > 1) {
+          const totalDur = Math.max(1000, s.end - s.start);
+          const chunkDur = totalDur / shortPieces.length;
+          shortPieces.forEach((piece, i) => {
+            const subStart = Math.round(s.start + i * chunkDur);
+            const subEnd = Math.round(s.start + (i + 1) * chunkDur);
+            cues.push({
+              start: subStart,
+              end: Math.max(subStart + 400, subEnd),
+              text: formatBurmeseTwoLines(piece),
+            });
+          });
+        } else {
+          cues.push({
+            start: s.start,
+            end: s.end,
+            text: formatBurmeseTwoLines(shortPieces[0] || spokenText),
+          });
+        }
+      });
+
+      return cues
+        .map((c, idx) => `${idx + 1}\n${fmtSrtTime(c.start)} --> ${fmtSrtTime(c.end)}\n${c.text}\n`)
+        .join('\n');
+    }
+
+    return '';
   };
 
   // Export functions
@@ -500,21 +796,10 @@ export default function App() {
     URL.revokeObjectURL(url);
   };
 
-  const handleExportSrt = () => {
-    const lines = segments
-      .map((s, idx) => {
-        const text = s.translated || s.text;
-        return `${idx + 1}\n${fmtSrtTime(s.start)} --> ${fmtSrtTime(s.end)}\n${text}\n`;
-      })
-      .join('\n');
-    downloadFile('subtitles.srt', lines, 'application/x-subrip');
-  };
-
-  const handleExportTxt = () => {
-    const lines = segments
-      .map((s) => `${s.hasTimestamp ? `[${fmtTime(s.start)}] ` : ''}${s.text}${s.translated ? '\n       → ' + s.translated : ''}`)
-      .join('\n\n');
-    downloadFile('transcript.txt', lines, 'text/plain');
+  const handleDownloadSrt = (srtText?: string, filename = 'subtitles_burmese_2lines.srt') => {
+    const content = srtText || generateBurmeseTwoLineSrt(segments);
+    if (!content) return;
+    downloadFile(filename, content, 'application/x-subrip');
   };
 
   const handleCopyTranslation = async () => {
@@ -529,9 +814,16 @@ export default function App() {
     }
   };
 
+  interface TTSResult {
+    blob: Blob;
+    durationMs: number;
+    srt?: string;
+  }
+
   // CH.06 Edge TTS Core Generator
-  const generateSpeech = async (textToSpeak: string, customVoice?: string): Promise<Blob> => {
+  const generateSpeech = async (textToSpeak: string, customVoice?: string): Promise<TTSResult> => {
     const voiceToUse = customVoice || ttsVoice;
+    const normalizedText = convertNumbersInTextToBurmese(textToSpeak);
     const rateStr = `${ttsRate >= 0 ? '+' : ''}${ttsRate}%`;
     const pitchStr = `${ttsPitch >= 0 ? '+' : ''}${ttsPitch}Hz`;
     const volumeStr = `${ttsVolume >= 0 ? '+' : ''}${ttsVolume}%`;
@@ -540,17 +832,16 @@ export default function App() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        text: textToSpeak,
+        text: normalizedText,
         voice: voiceToUse,
         rate: rateStr,
         pitch: pitchStr,
         volume: volumeStr,
+        returnJson: true,
       }),
     });
 
-    const contentType = res.headers.get('content-type') || '';
-
-    if (!res.ok || !contentType.includes('audio')) {
+    if (!res.ok) {
       let errMsg = 'အသံဖိုင် ဖန်တီးမရပါ';
       try {
         const textData = await res.text();
@@ -570,7 +861,19 @@ export default function App() {
       throw new Error(errMsg);
     }
 
-    return await res.blob();
+    const data = await res.json();
+    const blob = safeBase64ToBlob(data.audioBase64 || '', 'audio/mpeg');
+
+    let exactDurationMs = await getExactAudioDurationMs(blob);
+    if (!exactDurationMs || exactDurationMs <= 0) {
+      exactDurationMs = data.durationMs || 0;
+    }
+
+    return {
+      blob,
+      durationMs: exactDurationMs,
+      srt: data.srt || '',
+    };
   };
 
   // Handle Full TTS Generate
@@ -596,7 +899,7 @@ export default function App() {
     setTtsLoading(true);
 
     try {
-      const blob = await generateSpeech(textToSpeak);
+      const { blob, durationMs, srt } = await generateSpeech(textToSpeak);
       const url = URL.createObjectURL(blob);
 
       if (ttsAudioUrl) {
@@ -606,11 +909,37 @@ export default function App() {
       setTtsAudioBlob(blob);
       setTtsAudioUrl(url);
 
-      // Auto play
       if (audioRef.current) {
         audioRef.current.src = url;
         audioRef.current.play().catch(() => {});
       }
+
+      // Convert audio blob to base64 for persistent history playback
+      const base64Audio = await blobToBase64(blob);
+      const voiceObj = PRIMARY_VOICES.find((v) => v.id === ttsVoice) || OTHER_VOICES.find((v) => v.id === ttsVoice);
+      const currentLangName = targetLang === '__custom__' ? customLang.trim() || 'Burmese' : targetLang;
+      const modelToUse = geminiModel === '__custom__' ? customModel.trim() || 'gemini-3.8-flash' : geminiModel;
+      const originalJoined = ttsSourceMode === 'transcript' ? segments.map((s) => s.text).filter(Boolean).join(' ') : undefined;
+
+      // Use the server-computed zero-drift SRT (or fallback)
+      const srtBurmese2Lines = srt || generateBurmeseTwoLineSrt([], textToSpeak, durationMs);
+      setCurrentTtsSrt(srtBurmese2Lines);
+
+      saveToHistory({
+        sourceText: originalJoined,
+        translatedText: textToSpeak,
+        targetLang: currentLangName,
+        geminiModel: modelToUse,
+        voiceId: ttsVoice,
+        voiceName: voiceObj ? voiceObj.name : ttsVoice,
+        speed: ttsRate,
+        pitch: ttsPitch,
+        volume: ttsVolume,
+        audioBase64: base64Audio,
+        hasAudio: true,
+        segmentCount: ttsSourceMode === 'transcript' ? segments.length : undefined,
+        srtContent: srtBurmese2Lines,
+      });
     } catch (err: any) {
       setTtsErr(err.message || String(err));
     } finally {
@@ -625,7 +954,7 @@ export default function App() {
 
     setActiveSegmentTtsId(seg.id);
     try {
-      const blob = await generateSpeech(text);
+      const { blob } = await generateSpeech(text);
       const url = URL.createObjectURL(blob);
       const audio = new Audio(url);
       audio.onended = () => {
@@ -642,6 +971,22 @@ export default function App() {
     }
   };
 
+  // Voice Selection with auto-preset speed and pitch
+  const handleSelectPrimaryVoice = (v: typeof PRIMARY_VOICES[0]) => {
+    setTtsVoice(v.id);
+    if (v.id.includes('Giuseppe')) {
+      setTtsRate(30);
+      setTtsPitch(10);
+    } else if (v.speedPreset !== undefined && v.speedPreset !== 0) {
+      setTtsRate(v.speedPreset);
+    } else if (v.id.includes('Nilar') || v.id.includes('Thiha')) {
+      if (ttsRate === 30 && ttsPitch === 10) {
+        setTtsRate(0);
+        setTtsPitch(0);
+      }
+    }
+  };
+
   // Audio Player Controls
   const togglePlayPause = () => {
     if (!audioRef.current || !ttsAudioUrl) return;
@@ -653,63 +998,200 @@ export default function App() {
   };
 
   const handleSeek = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (!audioRef.current) return;
-    const target = Number(e.target.value);
-    audioRef.current.currentTime = target;
-    setAudioCurrentTime(target);
+    const val = parseFloat(e.target.value);
+    if (audioRef.current) {
+      audioRef.current.currentTime = val;
+      setAudioCurrentTime(val);
+    }
   };
 
   const handleDownloadTTS = () => {
     if (!ttsAudioBlob) return;
-    const voiceLabel = ttsVoice === 'my-MM-NilarNeural' ? 'nilar' : ttsVoice === 'my-MM-ThihaNeural' ? 'thiha' : 'voice';
-    const filename = `edge-tts-${voiceLabel}-${Date.now()}.mp3`;
     const url = URL.createObjectURL(ttsAudioBlob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = filename;
+    const voicePrefix = ttsVoice.includes('Giuseppe') ? 'giuseppe_fast' : ttsVoice.includes('Thiha') ? 'thiha' : 'nilar';
+    a.download = `voice_${voicePrefix}_${Date.now()}.mp3`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
   };
 
-  const isReady = (assemblyKey.trim() && geminiKey.trim()) || segments.length > 0;
-  const isBusy = transStatus === 'TRANSCRIBING' || transStatus === 'UPLOADING' || translateStatus === 'TRANSLATING' || ttsLoading;
+  // CH.07 History Actions
+  const handlePlayHistoryAudio = (item: HistoryItem) => {
+    if (!historyAudioRef.current) return;
+
+    if (activeHistoryAudioId === item.id) {
+      if (isHistPlaying) {
+        historyAudioRef.current.pause();
+      } else {
+        historyAudioRef.current.play().catch(() => {});
+      }
+      return;
+    }
+
+    if (item.audioBase64) {
+      historyAudioRef.current.src = item.audioBase64;
+      historyAudioRef.current.play().catch(() => {});
+      setActiveHistoryAudioId(item.id);
+      setIsHistPlaying(true);
+    } else {
+      // If no stored audioBase64, synthesize directly
+      setActiveHistoryAudioId(item.id);
+      setIsHistPlaying(true);
+      generateSpeech(item.translatedText, item.voiceId)
+        .then(({ blob }) => {
+          const url = URL.createObjectURL(blob);
+          if (historyAudioRef.current) {
+            historyAudioRef.current.src = url;
+            historyAudioRef.current.play().catch(() => {});
+          }
+        })
+        .catch((err) => {
+          alert(`အသံဖိုင်ဖွင့်မရပါ: ${err.message || err}`);
+          setIsHistPlaying(false);
+          setActiveHistoryAudioId(null);
+        });
+    }
+  };
+
+  const handleDownloadHistoryAudio = (item: HistoryItem) => {
+    if (item.audioBase64) {
+      const a = document.createElement('a');
+      a.href = item.audioBase64;
+      a.download = `history_audio_${item.voiceId}_${item.id}.mp3`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    } else {
+      generateSpeech(item.translatedText, item.voiceId)
+        .then(({ blob }) => {
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = `history_audio_${item.voiceId}_${item.id}.mp3`;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          URL.revokeObjectURL(url);
+        })
+        .catch((err) => {
+          alert(`ဒေါင်းလုဒ် မအောင်မြင်ပါ: ${err.message || err}`);
+        });
+    }
+  };
+
+  const handleCopyHistoryText = async (text: string, id: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedHistId(id);
+      setTimeout(() => setCopiedHistId(null), 2500);
+    } catch {}
+  };
+
+  const handleLoadHistoryToEditor = (item: HistoryItem) => {
+    setTtsSourceMode('custom');
+    setCustomTtsText(item.translatedText);
+    setTtsVoice(item.voiceId);
+    setTtsRate(item.speed);
+    setTtsPitch(item.pitch);
+    setTtsVolume(item.volume);
+
+    // Scroll to CH.06
+    const ch6 = document.getElementById('ch-06-tts');
+    if (ch6) {
+      ch6.scrollIntoView({ behavior: 'smooth' });
+    }
+  };
+
+  const handleDeleteHistoryItem = (id: string) => {
+    if (activeHistoryAudioId === id && historyAudioRef.current) {
+      historyAudioRef.current.pause();
+      setActiveHistoryAudioId(null);
+      setIsHistPlaying(false);
+    }
+    const updated = history.filter((h) => h.id !== id);
+    setHistory(updated);
+    try {
+      localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(updated));
+    } catch {}
+  };
+
+  const handleClearAllHistory = () => {
+    if (historyAudioRef.current) {
+      historyAudioRef.current.pause();
+    }
+    setActiveHistoryAudioId(null);
+    setIsHistPlaying(false);
+    setHistory([]);
+    setConfirmClearHistory(false);
+    try {
+      localStorage.removeItem(HISTORY_STORAGE_KEY);
+    } catch {}
+  };
+
+  // Filtered history list
+  const filteredHistory = history.filter((h) => {
+    if (!historySearch.trim()) return true;
+    const q = historySearch.toLowerCase();
+    return (
+      h.translatedText.toLowerCase().includes(q) ||
+      (h.sourceText && h.sourceText.toLowerCase().includes(q)) ||
+      h.voiceName.toLowerCase().includes(q) ||
+      h.targetLang.toLowerCase().includes(q)
+    );
+  });
 
   return (
-    <div className="min-h-screen bg-[#0B0E11] text-[#EDF2F5] pb-24 px-4 sm:px-6 pt-6 font-['Inter','Noto_Sans_Myanmar',sans-serif]">
-      {/* Hidden audio element for global playback */}
-      <audio ref={audioRef} preload="metadata" />
+    <div className="min-h-screen bg-[#0B0E11] text-[#EDF2F5] selection:bg-[#3ED6B5]/30 font-sans pb-16">
+      {/* Hidden Audio Elements for Playback */}
+      <audio ref={audioRef} className="hidden" />
+      <audio ref={historyAudioRef} className="hidden" />
 
-      <div className="max-w-[920px] mx-auto">
-        {/* ===== Nameplate Header ===== */}
-        <header className="flex items-center justify-between pb-5 mb-7 border-b border-[#2A323C]">
-          <div className="flex items-baseline gap-3">
-            <h1 className="font-['Space_Grotesk'] text-2xl font-bold tracking-wide">
-              Translate<span className="text-[#3ED6B5]">Tool</span>
-            </h1>
-            <span className="font-['JetBrains_Mono'] text-[11px] text-[#5C6672] uppercase tracking-wider hidden sm:inline">
-              Transcribe · Translate · Edge TTS
-            </span>
-          </div>
+      {/* Top Banner Header */}
+      <header className="border-b border-[#2A323C] bg-[#141920]/80 backdrop-blur sticky top-0 z-40">
+        <div className="max-w-5xl mx-auto px-4 sm:px-6 py-3.5 flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <span className="text-xs font-['JetBrains_Mono'] text-[#9AA7B2] hidden md:inline">
-              {segments.length > 0 ? `${segments.length} Segments` : 'Ready'}
-            </span>
-            <div
-              className={`w-2.5 h-2.5 rounded-full transition-all duration-300 ${
-                isBusy
-                  ? 'bg-[#F2A93B] shadow-[0_0_10px_2px_#F2A93B] animate-pulse-dot'
-                  : isReady
-                  ? 'bg-[#3ED6B5] shadow-[0_0_8px_1px_#3ED6B5]'
-                  : 'bg-[#5C6672]'
-              }`}
-              title={isBusy ? 'Busy Processing' : isReady ? 'System Ready' : 'Idle'}
-            />
+            <div className="w-9 h-9 rounded-lg bg-gradient-to-tr from-[#3ED6B5] to-[#229ED9] flex items-center justify-center text-[#0B0E11] font-bold shadow-md shadow-[#3ED6B5]/20">
+              <Radio className="w-5 h-5" />
+            </div>
+            <div>
+              <h1 className="font-['Space_Grotesk'] font-bold text-base sm:text-lg tracking-tight flex items-center gap-2">
+                <span>SIGNAL PATH</span>
+                <span className="text-[10px] font-['JetBrains_Mono'] px-2 py-0.5 rounded bg-[#3ED6B5]/15 text-[#3ED6B5] border border-[#3ED6B5]/30 font-normal">
+                  v3.0 PRO
+                </span>
+              </h1>
+              <p className="text-[11px] text-[#9AA7B2] font-['JetBrains_Mono']">
+                Universal AI Translate &amp; Edge Neural TTS Engine
+              </p>
+            </div>
           </div>
-        </header>
 
-        {/* ===== CH.01 — API KEYS ===== */}
+          <div className="flex items-center gap-3">
+            <a
+              href="#ch-07-history"
+              className="text-xs font-['JetBrains_Mono'] text-[#9AA7B2] hover:text-[#3ED6B5] flex items-center gap-1.5 px-3 py-1.5 rounded bg-[#1B222B] border border-[#2A323C] transition"
+            >
+              <History className="w-3.5 h-3.5 text-[#3ED6B5]" />
+              <span>မှတ်တမ်း ({history.length})</span>
+            </a>
+            <a
+              href="https://t.me/linlinzawofficial"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="hidden sm:flex items-center gap-1.5 text-xs font-['Space_Grotesk'] font-medium text-white bg-[#229ED9] hover:bg-[#229ED9]/90 px-3 py-1.5 rounded transition"
+            >
+              <Send className="w-3.5 h-3.5" />
+              <span>Telegram</span>
+            </a>
+          </div>
+        </div>
+      </header>
+
+      <div className="max-w-5xl mx-auto px-4 sm:px-6 pt-6">
+        {/* ===== CH.01 — API KEYS & MODEL CONFIGURATION ===== */}
         <section className="bg-[#141920] border border-[#2A323C] rounded-lg mb-5 overflow-hidden shadow-lg">
           <div className="flex items-center gap-3 px-5 py-3.5 border-b border-[#2A323C] bg-gradient-to-b from-white/[0.03] to-transparent">
             <span className="font-['JetBrains_Mono'] text-[11px] font-bold px-2 py-0.5 rounded bg-[#3ED6B5] text-[#0B0E11]">
@@ -717,15 +1199,11 @@ export default function App() {
             </span>
             <div className="flex items-center gap-2 font-['Space_Grotesk'] font-semibold text-[15px] flex-1">
               <Key className="w-4 h-4 text-[#3ED6B5]" />
-              API Keys & Settings
+              API Keys &amp; Model Configuration
             </div>
-            <div className="font-['JetBrains_Mono'] text-[10px] tracking-wider uppercase font-semibold">
-              {assemblyKey.trim() || geminiKey.trim() ? (
-                <span className="text-[#3ED6B5]">CONFIGURED</span>
-              ) : (
-                <span className="text-[#5C6672]">OPTIONAL / DEFAULT</span>
-              )}
-            </div>
+            <span className="font-['JetBrains_Mono'] text-[10px] tracking-wider uppercase text-[#9AA7B2]">
+              SETTINGS
+            </span>
           </div>
 
           <div className="p-5">
@@ -780,18 +1258,18 @@ export default function App() {
             </div>
 
             <div className="mt-4 flex flex-wrap gap-4 items-center">
-              <div className="w-full sm:w-auto min-w-[240px]">
+              <div className="w-full sm:w-auto min-w-[260px]">
                 <label className="block font-['JetBrains_Mono'] text-[10px] text-[#9AA7B2] uppercase tracking-wider mb-1">
-                  Gemini Model
+                  Gemini Translation Model (ဘာသာပြန် Model)
                 </label>
                 <select
                   value={geminiModel}
                   onChange={(e) => setGeminiModel(e.target.value)}
                   className="w-full bg-[#0B0E11] border border-[#2A323C] text-[#EDF2F5] px-3 py-2 rounded font-['JetBrains_Mono'] text-xs focus:border-[#3ED6B5] outline-none cursor-pointer"
                 >
-                  <option value="gemini-3.8-flash">Gemini 3.8 Flash (နောက်ဆုံးပေါ် AI အမြန်ဆုံး)</option>
-                  <option value="gemini-3.7-flash">Gemini 3.7 Flash (တိကျမြန်ဆန်)</option>
-                  <option value="gemini-3.6-flash">Gemini 3.6 Flash (တည်ငြိမ်)</option>
+                  <option value="gemini-3.8-flash">Gemini 3.8 Flash (အဆင့်မြင့်ဆုံး စာသား 🎯)</option>
+                  <option value="gemini-3.7-flash">Gemini 3.7 Flash (နောက်ဆုံးပေါ် AI အမြန် 🚀)</option>
+                  <option value="gemini-3.6-flash">Gemini 3.6 Flash (အကြံပြုချက် - အတည်ငြိမ်ဆုံး ⚡)</option>
                   <option value="__custom__">Custom Model ID…</option>
                 </select>
               </div>
@@ -805,7 +1283,7 @@ export default function App() {
                     type="text"
                     value={customModel}
                     onChange={(e) => setCustomModel(e.target.value)}
-                    placeholder="e.g. gemini-2.5-flash"
+                    placeholder="e.g. gemini-3.6-flash"
                     className="w-full bg-[#0B0E11] border border-[#2A323C] text-[#EDF2F5] px-3 py-2 rounded font-['JetBrains_Mono'] text-xs focus:border-[#3ED6B5] outline-none"
                   />
                 </div>
@@ -848,58 +1326,48 @@ export default function App() {
               />
               <UploadCloud className="w-8 h-8 text-[#3ED6B5] mx-auto mb-2 opacity-80" />
               <div className="font-['Space_Grotesk'] text-sm font-medium text-[#EDF2F5]">
-                {selectedFile ? selectedFile.name : 'ကလစ်နှိပ်၍ အသံဖိုင် သို့မဟုတ် ဗီဒီယို ရွေးချယ်ပါ'}
+                {selectedFile ? selectedFile.name : 'အသံဖိုင် သို့မဟုတ် ဗီဒီယိုဖိုင် ရွေးချယ်ရန် ဤနေရာကို နှိပ်ပါ'}
               </div>
-              <div className="font-['JetBrains_Mono'] text-xs text-[#5C6672] mt-1">
+              <p className="text-xs text-[#9AA7B2] font-['JetBrains_Mono'] mt-1">
                 {selectedFile
-                  ? `${(selectedFile.size / 1024 / 1024).toFixed(2)} MB · ${selectedFile.type || 'Media File'}`
-                  : 'MP3, WAV, M4A, MP4, MOV, FLAC, AAC စသည်ဖြင့် ထောက်ပံ့ပါသည်'}
-              </div>
-            </div>
-
-            {/* Waveform indicator */}
-            <div className="flex items-center justify-center gap-1.5 h-10 my-3">
-              {[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15].map((i) => (
-                <div
-                  key={i}
-                  className={`w-1 rounded-full transition-all duration-200 ${
-                    transStatus === 'TRANSCRIBING' || transStatus === 'UPLOADING'
-                      ? 'bg-[#3ED6B5] wave-bar-anim'
-                      : selectedFile
-                      ? 'bg-[#3ED6B5]/40 h-4'
-                      : 'bg-[#2A323C] h-1.5'
-                  }`}
-                  style={{ animationDelay: `${i * 0.08}s` }}
-                />
-              ))}
+                  ? `${(selectedFile.size / (1024 * 1024)).toFixed(2)} MB · Click to change`
+                  : 'MP3, WAV, M4A, MP4, MKV ဖိုင်များ ထည့်သွင်းနိုင်ပါသည်'}
+              </p>
             </div>
 
             {transProgress && (
-              <div className="font-['JetBrains_Mono'] text-xs text-[#F2A93B] text-center mb-3">
-                {transProgress}
-              </div>
+              <div className="font-['JetBrains_Mono'] text-xs text-[#3ED6B5] mt-3">{transProgress}</div>
             )}
 
             {transErr && (
-              <div className="bg-[#E8604C]/10 border border-[#E8604C] text-[#F5B8AD] px-3.5 py-2.5 rounded text-xs font-['JetBrains_Mono'] mb-3">
+              <div className="bg-[#E8604C]/10 border border-[#E8604C] text-[#F5B8AD] px-3.5 py-2.5 rounded text-xs font-['JetBrains_Mono'] mt-3">
                 {transErr}
               </div>
             )}
 
-            <div className="flex gap-2">
+            <div className="mt-4 flex items-center justify-between">
               <button
                 onClick={handleTranscribe}
-                disabled={!selectedFile || transStatus === 'TRANSCRIBING' || transStatus === 'UPLOADING'}
-                className="bg-[#3ED6B5] hover:bg-[#3ED6B5]/90 disabled:bg-[#1B222B] disabled:text-[#5C6672] text-[#08211B] font-['Space_Grotesk'] font-semibold text-xs px-5 py-2.5 rounded flex items-center gap-2 transition cursor-pointer disabled:cursor-not-allowed"
+                disabled={!selectedFile || transStatus === 'UPLOADING' || transStatus === 'TRANSCRIBING'}
+                className="bg-[#3ED6B5] hover:bg-[#3ED6B5]/90 disabled:bg-[#1B222B] disabled:text-[#5C6672] text-[#08211B] font-['Space_Grotesk'] font-bold text-xs px-4 py-2.5 rounded flex items-center gap-2 transition cursor-pointer disabled:cursor-not-allowed"
               >
-                <Radio className="w-3.5 h-3.5" />
-                Run Transcription (စာသားထုတ်မည်)
+                {transStatus === 'TRANSCRIBING' || transStatus === 'UPLOADING' ? (
+                  <>
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                    Transcribing…
+                  </>
+                ) : (
+                  <>
+                    <Sparkles className="w-3.5 h-3.5" />
+                    Start AssemblyAI Transcribe
+                  </>
+                )}
               </button>
             </div>
           </div>
         </section>
 
-        {/* ===== CH.03 — PASTE TEXT (SKIP TRANSCRIPTION) ===== */}
+        {/* ===== CH.03 — PASTE TEXT / SRT / DIALOGUE ===== */}
         <section className="bg-[#141920] border border-[#2A323C] rounded-lg mb-5 overflow-hidden shadow-lg">
           <div className="flex items-center gap-3 px-5 py-3.5 border-b border-[#2A323C] bg-gradient-to-b from-white/[0.03] to-transparent">
             <span className="font-['JetBrains_Mono'] text-[11px] font-bold px-2 py-0.5 rounded bg-[#3ED6B5] text-[#0B0E11]">
@@ -907,7 +1375,7 @@ export default function App() {
             </span>
             <div className="flex items-center gap-2 font-['Space_Grotesk'] font-semibold text-[15px] flex-1">
               <FileText className="w-4 h-4 text-[#3ED6B5]" />
-              Paste Text / SRT (စာသားတိုက်ရိုက်ကူးထည့်ရန်)
+              Paste Text / SRT / Dialogue (စာသား တိုက်ရိုက်ထည့်ရန်)
             </div>
             <span className="font-['JetBrains_Mono'] text-[10px] tracking-wider uppercase text-[#9AA7B2]">
               {pasteStatus}
@@ -915,91 +1383,108 @@ export default function App() {
           </div>
 
           <div className="p-5">
-            <label className="block font-['JetBrains_Mono'] text-[10px] text-[#9AA7B2] uppercase tracking-wider mb-2">
-              Text or SRT Subtitles to Translate
-            </label>
             <textarea
               rows={4}
               value={pasteText}
               onChange={(e) => setPasteText(e.target.value)}
-              placeholder="အသံဖိုင်မရှိပါက စာသား သို့မဟုတ် .srt စာတန်းထိုးများကို ဤနေရာတွင် တိုက်ရိုက်ကူးထည့်၍ ဘာသာပြန်ခြင်း/TTS ပြုလုပ်နိုင်ပါသည်…"
-              className="w-full bg-[#0B0E11] border border-[#2A323C] text-[#EDF2F5] p-3 rounded text-xs focus:border-[#3ED6B5] outline-none resize-y leading-relaxed transition"
+              placeholder="ဘာသာပြန်လိုသော အင်္ဂလိပ်စာသား၊ အခြားဘာသာစာသား သို့မဟုတ် SRT Subtitles များကို ဤနေရာတွင် Paste လုပ်ပါ…"
+              className="w-full bg-[#0B0E11] border border-[#2A323C] text-[#EDF2F5] p-3 rounded font-['JetBrains_Mono'] text-xs focus:border-[#3ED6B5] outline-none resize-y leading-relaxed transition"
             />
 
             {pasteErr && (
-              <div className="bg-[#E8604C]/10 border border-[#E8604C] text-[#F5B8AD] px-3.5 py-2.5 rounded text-xs font-['JetBrains_Mono'] mt-2">
+              <div className="bg-[#E8604C]/10 border border-[#E8604C] text-[#F5B8AD] px-3.5 py-2 rounded text-xs font-['JetBrains_Mono'] mt-2">
                 {pasteErr}
               </div>
             )}
 
-            <div className="flex gap-2 mt-3">
-              <button
-                onClick={handleUsePastedText}
-                className="bg-[#3ED6B5] hover:bg-[#3ED6B5]/90 text-[#08211B] font-['Space_Grotesk'] font-semibold text-xs px-4 py-2 rounded flex items-center gap-2 transition cursor-pointer"
-              >
-                <Check className="w-3.5 h-3.5" />
-                Transcript (စာကြောင်းများ ခွဲထုတ်မည်)
-              </button>
-              <button
-                onClick={handleClearPastedText}
-                className="border border-[#2A323C] hover:border-[#3ED6B5] text-[#9AA7B2] hover:text-[#3ED6B5] font-['Space_Grotesk'] text-xs px-4 py-2 rounded flex items-center gap-2 transition cursor-pointer"
-              >
-                <Trash2 className="w-3.5 h-3.5" />
-                Clear
-              </button>
+            <div className="mt-3 flex items-center justify-between">
+              <div className="flex gap-2">
+                <button
+                  onClick={handleUsePastedText}
+                  className="bg-[#1B222B] hover:bg-[#3ED6B5] text-[#3ED6B5] hover:text-[#08211B] border border-[#3ED6B5]/50 font-['Space_Grotesk'] font-semibold text-xs px-3.5 py-2 rounded transition cursor-pointer"
+                >
+                  Use This Text (စာသား ထည့်သွင်းမည်)
+                </button>
+                <button
+                  onClick={handleClearPastedText}
+                  className="text-[#9AA7B2] hover:text-[#EDF2F5] font-['Space_Grotesk'] text-xs px-3 py-2 rounded transition cursor-pointer"
+                >
+                  Clear
+                </button>
+              </div>
+
+              <div className="text-[11px] text-[#5C6672] font-['JetBrains_Mono']">
+                Auto-splits by sentences or SRT timestamps
+              </div>
             </div>
           </div>
         </section>
 
-        {/* ===== CH.04 — TRANSCRIPT (TIMESTAMPED) ===== */}
+        {/* ===== CH.04 — TRANSCRIPT SEGMENTS ===== */}
         <section className="bg-[#141920] border border-[#2A323C] rounded-lg mb-5 overflow-hidden shadow-lg">
           <div className="flex items-center gap-3 px-5 py-3.5 border-b border-[#2A323C] bg-gradient-to-b from-white/[0.03] to-transparent">
             <span className="font-['JetBrains_Mono'] text-[11px] font-bold px-2 py-0.5 rounded bg-[#3ED6B5] text-[#0B0E11]">
               CH.04
             </span>
             <div className="flex items-center gap-2 font-['Space_Grotesk'] font-semibold text-[15px] flex-1">
-              <Sliders className="w-4 h-4 text-[#3ED6B5]" />
-              Transcript (Timestamped စာကြောင်းများ)
+              <FileText className="w-4 h-4 text-[#3ED6B5]" />
+              Transcript Segments ({segments.length} Lines)
             </div>
-            <span className="font-['JetBrains_Mono'] text-[10px] tracking-wider uppercase text-[#3ED6B5] font-bold">
-              {segments.length} SEGMENTS
-            </span>
+            {segments.length > 0 && (
+              <button
+                onClick={() => {
+                  setSegments([]);
+                  setTranslateProgress('');
+                  setTranslateErr('');
+                }}
+                className="text-[#9AA7B2] hover:text-[#E8604C] hover:bg-[#E8604C]/10 px-2.5 py-1 rounded border border-[#2A323C] hover:border-[#E8604C]/30 text-xs font-['JetBrains_Mono'] flex items-center gap-1.5 transition cursor-pointer"
+                title="Clear all segments"
+              >
+                <Trash2 className="w-3.5 h-3.5 text-[#E8604C]" />
+                <span>Clear All</span>
+              </button>
+            )}
           </div>
 
           <div className="p-5">
             {segments.length === 0 ? (
-              <div className="text-center py-8 text-[#5C6672] text-xs font-['Inter'] italic">
-                အသံဖိုင်ကို transcribe လုပ်ပြီးမှ သို့မဟုတ် CH.03 တွင် စာသားထည့်ပြီးမှ စာကြောင်းများ timestamp
-                နှင့်တကွ ဤနေရာတွင် ပေါ်လာပါမည်။
+              <div className="text-center py-8 text-[#5C6672] font-['Space_Grotesk'] text-xs">
+                စာသား မရှိသေးပါ။ CH.02 တွင် အသံဖိုင် စာသားပြောင်းပါ သို့မဟုတ် CH.03 တွင် စာသား ကူးထည့်ပါ။
               </div>
             ) : (
-              <div className="max-h-[380px] overflow-y-auto pr-2 divide-y divide-[#2A323C]/60">
+              <div className="space-y-2.5 max-h-96 overflow-y-auto pr-1">
                 {segments.map((seg, idx) => (
-                  <div key={seg.id} className="py-3 flex items-start gap-3 group">
-                    <span className="font-['JetBrains_Mono'] text-[11px] text-[#F2A93B] bg-[#0B0E11] border border-[#F2A93B]/30 px-2 py-0.5 rounded whitespace-nowrap mt-0.5">
-                      {seg.hasTimestamp ? fmtTime(seg.start) : `#${idx + 1}`}
-                    </span>
-                    <div className="flex-1">
-                      <div className="text-xs text-[#EDF2F5] leading-relaxed select-text">{seg.text}</div>
-                      {seg.translated && (
-                        <div className="text-xs text-[#3ED6B5] leading-relaxed font-['Noto_Sans_Myanmar'] mt-1.5 bg-[#3ED6B5]/5 p-2 rounded border border-[#3ED6B5]/20 select-text">
-                          {seg.translated}
-                        </div>
-                      )}
+                  <div
+                    key={seg.id}
+                    className="p-3 rounded bg-[#0B0E11] border border-[#2A323C] text-xs space-y-1.5 hover:border-[#3ED6B5]/40 transition"
+                  >
+                    <div className="flex items-center justify-between text-[#5C6672] font-['JetBrains_Mono'] text-[10px]">
+                      <span>
+                        #{idx + 1} {seg.hasTimestamp && `[${fmtTime(seg.start)} → ${fmtTime(seg.end)}]`}
+                      </span>
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={() => handleSpeakSegment(seg)}
+                          disabled={activeSegmentTtsId === seg.id}
+                          className="text-[#3ED6B5] hover:underline flex items-center gap-1 cursor-pointer"
+                        >
+                          {activeSegmentTtsId === seg.id ? (
+                            <RefreshCw className="w-3 h-3 animate-spin" />
+                          ) : (
+                            <Volume2 className="w-3 h-3" />
+                          )}
+                          <span>Speak</span>
+                        </button>
+                      </div>
                     </div>
-                    {/* Instant TTS per segment */}
-                    <button
-                      onClick={() => handleSpeakSegment(seg)}
-                      disabled={activeSegmentTtsId === seg.id}
-                      title="ဒီစာကြောင်းကို Edge TTS ဖြင့် ချက်ချင်း အသံနားထောင်မည်"
-                      className="opacity-70 group-hover:opacity-100 p-1.5 rounded hover:bg-[#3ED6B5]/10 text-[#9AA7B2] hover:text-[#3ED6B5] transition cursor-pointer"
-                    >
-                      {activeSegmentTtsId === seg.id ? (
-                        <RefreshCw className="w-3.5 h-3.5 animate-spin text-[#3ED6B5]" />
-                      ) : (
-                        <Volume2 className="w-3.5 h-3.5" />
-                      )}
-                    </button>
+
+                    <div className="text-[#9AA7B2] font-['JetBrains_Mono']">{seg.text}</div>
+
+                    {seg.translated && (
+                      <div className="text-[#3ED6B5] font-['Noto_Sans_Myanmar'] text-[13px] pt-1 border-t border-[#2A323C]/50 leading-relaxed">
+                        → {seg.translated}
+                      </div>
+                    )}
                   </div>
                 ))}
               </div>
@@ -1007,15 +1492,15 @@ export default function App() {
           </div>
         </section>
 
-        {/* ===== CH.05 — TRANSLATE ===== */}
+        {/* ===== CH.05 — GEMINI TRANSLATE ===== */}
         <section className="bg-[#141920] border border-[#2A323C] rounded-lg mb-5 overflow-hidden shadow-lg">
           <div className="flex items-center gap-3 px-5 py-3.5 border-b border-[#2A323C] bg-gradient-to-b from-white/[0.03] to-transparent">
-            <span className="font-['JetBrains_Mono'] text-[11px] font-bold px-2 py-0.5 rounded bg-[#3ED6B5] text-[#0B0E11]">
+            <span className="font-['JetBrains_Mono'] text-[11px] font-bold px-2 py-0.5 rounded bg-[#F2A93B] text-[#2E1D06]">
               CH.05
             </span>
             <div className="flex items-center gap-2 font-['Space_Grotesk'] font-semibold text-[15px] flex-1">
-              <Languages className="w-4 h-4 text-[#3ED6B5]" />
-              Translate (ဘာသာပြန်ဆိုခြင်း)
+              <Languages className="w-4 h-4 text-[#F2A93B]" />
+              Gemini AI Translate (ဘာသာပြန်စနစ်)
             </div>
             <span className="font-['JetBrains_Mono'] text-[10px] tracking-wider uppercase text-[#9AA7B2]">
               {translateStatus}
@@ -1033,10 +1518,10 @@ export default function App() {
                   onChange={(e) => setTargetLang(e.target.value)}
                   className="w-full bg-[#0B0E11] border border-[#2A323C] text-[#EDF2F5] px-3 py-2 rounded font-['JetBrains_Mono'] text-xs focus:border-[#3ED6B5] outline-none cursor-pointer"
                 >
-                  <option value="Burmese (Myanmar)">မြန်မာ (Burmese)</option>
+                  <option value="Burmese (Myanmar)">မြန်မာစာ (Burmese)</option>
                   <option value="English">English</option>
-                  <option value="Thai">ไทย (Thai)</option>
-                  <option value="Chinese (Simplified)">中文 (Chinese)</option>
+                  <option value="Thai">ภาษาไทย (Thai)</option>
+                  <option value="Chinese (Simplified)">中文 (Chinese Simplified)</option>
                   <option value="Japanese">日本語 (Japanese)</option>
                   <option value="Korean">한국어 (Korean)</option>
                   <option value="French">Français</option>
@@ -1071,64 +1556,53 @@ export default function App() {
               </div>
             )}
 
-            <div className="flex flex-wrap gap-2.5 items-center">
-              <button
-                onClick={handleTranslate}
-                disabled={segments.length === 0 || translateStatus === 'TRANSLATING'}
-                className="bg-[#F2A93B] hover:bg-[#F2A93B]/90 disabled:bg-[#1B222B] disabled:text-[#5C6672] text-[#2E1D06] font-['Space_Grotesk'] font-semibold text-xs px-4 py-2.5 rounded flex items-center gap-2 transition cursor-pointer disabled:cursor-not-allowed"
-              >
-                {translateStatus === 'TRANSLATING' ? (
-                  <>
-                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                    Translating…
-                  </>
-                ) : (
-                  <>
-                    <Languages className="w-3.5 h-3.5" />
-                    Translate Transcript (ဘာသာပြန်မည်)
-                  </>
-                )}
-              </button>
+            <div className="flex flex-wrap gap-2.5 items-center justify-between">
+              <div className="flex flex-wrap gap-2.5 items-center">
+                <button
+                  onClick={handleTranslate}
+                  disabled={segments.length === 0 || translateStatus === 'TRANSLATING'}
+                  className="bg-[#F2A93B] hover:bg-[#F2A93B]/90 disabled:bg-[#1B222B] disabled:text-[#5C6672] text-[#2E1D06] font-['Space_Grotesk'] font-semibold text-xs px-4 py-2.5 rounded flex items-center gap-2 transition cursor-pointer disabled:cursor-not-allowed"
+                >
+                  {translateStatus === 'TRANSLATING' ? (
+                    <>
+                      <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                      Translating…
+                    </>
+                  ) : (
+                    <>
+                      <Languages className="w-3.5 h-3.5" />
+                      Translate Transcript (ဘာသာပြန်မည်)
+                    </>
+                  )}
+                </button>
 
-              <button
-                onClick={handleExportSrt}
-                disabled={segments.length === 0}
-                className="border border-[#2A323C] hover:border-[#3ED6B5] disabled:border-[#2A323C]/40 text-[#9AA7B2] hover:text-[#3ED6B5] disabled:text-[#5C6672] font-['Space_Grotesk'] text-xs px-3.5 py-2.5 rounded flex items-center gap-1.5 transition cursor-pointer disabled:cursor-not-allowed"
-              >
-                <Download className="w-3.5 h-3.5" />
-                Download .srt
-              </button>
+                <button
+                  onClick={handleCopyTranslation}
+                  disabled={segments.length === 0}
+                  className="border border-[#2A323C] hover:border-[#3ED6B5] disabled:border-[#2A323C]/40 text-[#9AA7B2] hover:text-[#3ED6B5] disabled:text-[#5C6672] font-['Space_Grotesk'] text-xs px-3.5 py-2.5 rounded flex items-center gap-1.5 transition cursor-pointer disabled:cursor-not-allowed"
+                >
+                  {copiedStatus ? <Check className="w-3.5 h-3.5 text-[#3ED6B5]" /> : <Copy className="w-3.5 h-3.5" />}
+                  {copiedStatus ? 'Copied ✓' : 'Copy Translation'}
+                </button>
+              </div>
 
-              <button
-                onClick={handleExportTxt}
-                disabled={segments.length === 0}
-                className="border border-[#2A323C] hover:border-[#3ED6B5] disabled:border-[#2A323C]/40 text-[#9AA7B2] hover:text-[#3ED6B5] disabled:text-[#5C6672] font-['Space_Grotesk'] text-xs px-3.5 py-2.5 rounded flex items-center gap-1.5 transition cursor-pointer disabled:cursor-not-allowed"
-              >
-                <Download className="w-3.5 h-3.5" />
-                Download .txt
-              </button>
-
-              <button
-                onClick={handleCopyTranslation}
-                disabled={segments.length === 0}
-                className="border border-[#2A323C] hover:border-[#3ED6B5] disabled:border-[#2A323C]/40 text-[#9AA7B2] hover:text-[#3ED6B5] disabled:text-[#5C6672] font-['Space_Grotesk'] text-xs px-3.5 py-2.5 rounded flex items-center gap-1.5 transition cursor-pointer disabled:cursor-not-allowed"
-              >
-                {copiedStatus ? <Check className="w-3.5 h-3.5 text-[#3ED6B5]" /> : <Copy className="w-3.5 h-3.5" />}
-                {copiedStatus ? 'Copied ✓' : 'Copy Translation'}
-              </button>
+              <span className="text-[11px] text-[#5C6672] font-['Noto_Sans_Myanmar'] flex items-center gap-1">
+                <Subtitles className="w-3.5 h-3.5 text-[#3ED6B5]" />
+                အသံဖိုင်ထုတ်ယူသည့်အခါ မြန်မာ ၂ ကြောင်း စာတန်းထိုး .SRT ဖိုင်ကို CH.07 History တွင် သိမ်းဆည်းပေးမည်
+              </span>
             </div>
           </div>
         </section>
 
-        {/* ===== CH.06 — TEXT TO TTS (EDGE TTS) သီဟ၊ နီလာ ===== */}
-        <section className="bg-[#141920] border-2 border-[#3ED6B5]/60 rounded-lg mb-6 overflow-hidden shadow-2xl relative">
+        {/* ===== CH.06 — TEXT TO TTS (EDGE TTS) နီလာ၊ သီဟ၊ မောင်ကျော်သူ ===== */}
+        <section id="ch-06-tts" className="bg-[#141920] border-2 border-[#3ED6B5]/60 rounded-lg mb-6 overflow-hidden shadow-2xl relative">
           <div className="flex items-center gap-3 px-5 py-4 border-b border-[#2A323C] bg-gradient-to-r from-[#3ED6B5]/10 via-transparent to-transparent">
             <span className="font-['JetBrains_Mono'] text-[12px] font-bold px-2.5 py-0.5 rounded bg-[#3ED6B5] text-[#0B0E11] shadow">
               CH.06
             </span>
             <div className="flex items-center gap-2 font-['Space_Grotesk'] font-bold text-base text-[#EDF2F5] flex-1">
               <Volume2 className="w-5 h-5 text-[#3ED6B5]" />
-              Text to TTS (Edge TTS) — သီဟ၊ နီလာ အသံဖိုင် စာသားကနေ ထုတ်ယူခြင်း
+              Text to TTS (Edge TTS) — နီလာ၊ သီဟ၊ မောင်ကျော်သူ အသံဖိုင် စာသားကနေ ထုတ်ယူခြင်း
             </div>
             <span className="font-['JetBrains_Mono'] text-[10px] tracking-wider uppercase text-[#3ED6B5] bg-[#3ED6B5]/10 px-2 py-0.5 rounded border border-[#3ED6B5]/20 font-semibold">
               EDGE NEURAL TTS
@@ -1136,53 +1610,79 @@ export default function App() {
           </div>
 
           <div className="p-5 sm:p-6 space-y-6">
-            {/* Voice Cards: Thiha & Nilar */}
+            {/* Voice Cards: Nilar, Thiha, Giuseppe (မောင်ကျော်သူ) */}
             <div>
-              <label className="block font-['JetBrains_Mono'] text-[11px] text-[#3ED6B5] uppercase tracking-wider mb-2.5 font-semibold">
-                ၁။ အသံရွေးချယ်ပါ (Select Neural Voice)
-              </label>
+              <div className="flex items-center justify-between mb-2.5">
+                <label className="font-['JetBrains_Mono'] text-[11px] text-[#3ED6B5] uppercase tracking-wider font-semibold">
+                  ၁။ အသံရွေးချယ်ပါ (Select Neural Voice)
+                </label>
+                <span className="text-[11px] font-['JetBrains_Mono'] text-[#9AA7B2]">
+                  ရွေးချယ်ထားသော အသံ: <span className="text-[#3ED6B5] font-bold">{ttsVoice}</span>
+                </span>
+              </div>
 
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
-                {BURMESE_VOICES.map((v) => {
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3.5">
+                {PRIMARY_VOICES.map((v) => {
                   const isSelected = ttsVoice === v.id;
                   return (
                     <div
                       key={v.id}
-                      onClick={() => setTtsVoice(v.id)}
-                      className={`p-4 rounded-lg border-2 cursor-pointer transition-all duration-200 flex items-start gap-3.5 ${
+                      onClick={() => handleSelectPrimaryVoice(v)}
+                      className={`p-4 rounded-lg border-2 cursor-pointer transition-all duration-200 flex flex-col justify-between ${
                         isSelected
-                          ? 'border-[#3ED6B5] bg-[#3ED6B5]/10 shadow-[0_0_15px_rgba(62,214,181,0.15)]'
+                          ? 'border-[#3ED6B5] bg-[#3ED6B5]/10 shadow-[0_0_15px_rgba(62,214,181,0.15)] ring-1 ring-[#3ED6B5]'
                           : 'border-[#2A323C] bg-[#0B0E11] hover:border-[#3ED6B5]/50'
                       }`}
                     >
-                      <div
-                        className={`w-10 h-10 rounded-full flex items-center justify-center font-bold text-sm shrink-0 ${
-                          isSelected ? 'bg-[#3ED6B5] text-[#0B0E11]' : 'bg-[#1B222B] text-[#9AA7B2]'
-                        }`}
-                      >
-                        {v.name.includes('နီလာ') ? '👩' : '👨'}
+                      <div className="flex items-start gap-3">
+                        <div
+                          className={`w-10 h-10 rounded-full flex items-center justify-center font-bold text-base shrink-0 shadow-inner ${
+                            isSelected ? 'bg-[#3ED6B5] text-[#0B0E11]' : 'bg-[#1B222B] text-[#9AA7B2]'
+                          }`}
+                        >
+                          {v.icon}
+                        </div>
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center justify-between gap-1">
+                            <span className="font-['Space_Grotesk'] font-bold text-sm text-[#EDF2F5] truncate">
+                              {v.name}
+                            </span>
+                          </div>
+                          <div className="text-[10px] font-['JetBrains_Mono'] text-[#3ED6B5] font-semibold mt-0.5">
+                            {v.gender}
+                          </div>
+                        </div>
                       </div>
-                      <div className="flex-1">
-                        <div className="flex items-center justify-between">
-                          <span className="font-['Space_Grotesk'] font-bold text-sm text-[#EDF2F5]">
-                            {v.name}
-                          </span>
-                          <span
-                            className={`text-[10px] font-['JetBrains_Mono'] px-2 py-0.5 rounded uppercase font-semibold ${
-                              isSelected
-                                ? 'bg-[#3ED6B5] text-[#0B0E11]'
-                                : 'bg-[#1B222B] text-[#9AA7B2]'
-                            }`}
+
+                      <p className="text-xs text-[#9AA7B2] font-['Noto_Sans_Myanmar'] mt-2.5 leading-relaxed">
+                        {v.desc}
+                      </p>
+
+                      <div className="mt-3 pt-2.5 border-t border-[#2A323C]/50 flex items-center justify-between">
+                        <span
+                          className={`text-[10px] font-['JetBrains_Mono'] px-2 py-0.5 rounded font-semibold ${
+                            isSelected
+                              ? 'bg-[#3ED6B5] text-[#0B0E11]'
+                              : 'bg-[#1B222B] text-[#9AA7B2]'
+                          }`}
+                        >
+                          {v.badge}
+                        </span>
+
+                        {v.id.includes('Giuseppe') && (
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setTtsVoice(v.id);
+                              setTtsRate(30);
+                            }}
+                            className="text-[10px] font-['JetBrains_Mono'] px-2 py-0.5 rounded bg-[#3ED6B5]/20 text-[#3ED6B5] hover:bg-[#3ED6B5] hover:text-[#0B0E11] transition"
+                            title="Set Speed to 1.3x (+30%)"
                           >
-                            {v.badge}
-                          </span>
-                        </div>
-                        <p className="text-xs text-[#9AA7B2] font-['Noto_Sans_Myanmar'] mt-1 leading-relaxed">
-                          {v.desc}
-                        </p>
-                        <div className="font-['JetBrains_Mono'] text-[10px] text-[#5C6672] mt-1.5">
-                          ID: {v.id}
-                        </div>
+                            ⚡ Apply 1.3x Speed
+                          </button>
+                        )}
                       </div>
                     </div>
                   );
@@ -1199,11 +1699,12 @@ export default function App() {
                   onChange={(e) => setTtsVoice(e.target.value)}
                   className="bg-[#0B0E11] border border-[#2A323C] text-[#9AA7B2] text-xs px-2.5 py-1 rounded font-['JetBrains_Mono'] outline-none focus:border-[#3ED6B5] cursor-pointer"
                 >
-                  <optgroup label="🇲🇲 မြန်မာ အသံများ (Burmese Neural Voices)">
-                    <option value="my-MM-NilarNeural">နီလာ (Nilar - Female)</option>
-                    <option value="my-MM-ThihaNeural">သီဟ (Thiha - Male)</option>
+                  <optgroup label="🌟 Featured Neural Voices (အဓိက အသံများ)">
+                    <option value="my-MM-NilarNeural">နီလာ (Nilar - Female မြန်မာ)</option>
+                    <option value="my-MM-ThihaNeural">သီဟ (Thiha - Male မြန်မာ)</option>
+                    <option value="it-IT-GiuseppeMultilingualNeural">မောင်ကျော်သူ (Giuseppe Fast Vibe ⚡ - Multilingual)</option>
                   </optgroup>
-                  <optgroup label="🌐 အခြားနိုင်ငံတကာ အသံများ">
+                  <optgroup label="🌐 Global Voices (အခြားနိုင်ငံတကာ အသံများ)">
                     {OTHER_VOICES.map((ov) => (
                       <option key={ov.id} value={ov.id}>
                         {ov.name}
@@ -1258,21 +1759,82 @@ export default function App() {
                   )}
                 </div>
               ) : (
-                <textarea
-                  rows={3}
-                  value={customTtsText}
-                  onChange={(e) => setCustomTtsText(e.target.value)}
-                  placeholder="အသံထုတ်လိုသော မြန်မာစာသား သို့မဟုတ် အင်္ဂလိပ်စာသားကို ဤနေရာတွင် ရိုက်ထည့်ပါ…"
-                  className="w-full bg-[#0B0E11] border border-[#2A323C] text-[#EDF2F5] p-3 rounded text-xs focus:border-[#3ED6B5] outline-none resize-y leading-relaxed font-['Noto_Sans_Myanmar'] transition"
-                />
+                <div className="space-y-1.5">
+                  <textarea
+                    rows={3}
+                    value={customTtsText}
+                    onChange={(e) => setCustomTtsText(e.target.value)}
+                    placeholder="အသံထုတ်လိုသော မြန်မာစာသား သို့မဟုတ် အင်္ဂလိပ်စာသားကို ဤနေရာတွင် ရိုက်ထည့်ပါ… (ဥပမာ- 70000, 10000, ၇၀၀၀, ၈၀၀၀)"
+                    className="w-full bg-[#0B0E11] border border-[#2A323C] text-[#EDF2F5] p-3 rounded text-xs focus:border-[#3ED6B5] outline-none resize-y leading-relaxed font-['Noto_Sans_Myanmar'] transition"
+                  />
+                  <div className="flex items-center justify-between">
+                    <button
+                      type="button"
+                      onClick={() => setCustomTtsText(convertNumbersInTextToBurmese(customTtsText))}
+                      className="text-[11px] font-['Space_Grotesk'] text-[#3ED6B5] hover:underline flex items-center gap-1 cursor-pointer bg-[#3ED6B5]/10 hover:bg-[#3ED6B5]/20 px-2.5 py-1 rounded border border-[#3ED6B5]/30 transition"
+                      title="Convert 70000 -> ၇ သောင်း, 10000 -> ၁ သောင်း, 7000 -> ၇ ထောင်, 8000 -> ၈ ထောင်"
+                    >
+                      <Hash className="w-3 h-3" />
+                      <span>နံပါတ်များကို မြန်မာလို ပြောင်းမည် (၇ သောင်း၊ ၈ ထောင်…)</span>
+                    </button>
+                    <span className="text-[10px] text-[#5C6672] font-['JetBrains_Mono']">
+                      Auto-converts 70000/10000/၇၀၀၀/၈၀၀၀ on TTS
+                    </span>
+                  </div>
+                </div>
               )}
             </div>
 
             {/* Voice Adjustments: Speed, Pitch, Volume */}
             <div className="bg-[#0B0E11]/70 border border-[#2A323C] rounded-lg p-4">
-              <div className="font-['JetBrains_Mono'] text-[10px] text-[#9AA7B2] uppercase tracking-wider mb-3 font-semibold flex items-center gap-1.5">
-                <Sliders className="w-3.5 h-3.5 text-[#3ED6B5]" />
-                အသံ ထိန်းညှိမှုများ (Speech Parameters)
+              <div className="flex items-center justify-between mb-3">
+                <div className="font-['JetBrains_Mono'] text-[10px] text-[#9AA7B2] uppercase tracking-wider font-semibold flex items-center gap-1.5">
+                  <Sliders className="w-3.5 h-3.5 text-[#3ED6B5]" />
+                  အသံ ထိန်းညှိမှုများ (Speech Parameters)
+                </div>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setTtsRate(30);
+                      setTtsPitch(10);
+                    }}
+                    className={`text-[10px] font-['JetBrains_Mono'] px-2 py-0.5 rounded transition ${
+                      ttsRate === 30 && ttsPitch === 10
+                        ? 'bg-[#3ED6B5] text-[#0B0E11] font-bold'
+                        : 'bg-[#1B222B] text-[#9AA7B2] hover:text-[#3ED6B5]'
+                    }`}
+                    title="Speed +30%, Pitch +10Hz"
+                  >
+                    ⚡ Fast Vibe 1.3x
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setTtsRate(60);
+                      setTtsPitch(12);
+                    }}
+                    className={`text-[10px] font-['JetBrains_Mono'] px-2 py-0.5 rounded transition ${
+                      ttsRate === 60 && ttsPitch === 12
+                        ? 'bg-[#3ED6B5] text-[#0B0E11] font-bold'
+                        : 'bg-[#1B222B] text-[#9AA7B2] hover:text-[#3ED6B5]'
+                    }`}
+                    title="Speed +60%, Pitch +12Hz (Story mode: ~5-6 mins)"
+                  >
+                    🚀 Story Fast 1.6x
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setTtsRate(0);
+                      setTtsPitch(0);
+                      setTtsVolume(0);
+                    }}
+                    className="text-[10px] font-['JetBrains_Mono'] px-2 py-0.5 rounded bg-[#1B222B] text-[#9AA7B2] hover:text-[#EDF2F5] transition"
+                  >
+                    Reset (1.0x)
+                  </button>
+                </div>
               </div>
 
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
@@ -1280,12 +1842,17 @@ export default function App() {
                 <div>
                   <div className="flex justify-between text-xs font-['JetBrains_Mono'] mb-1">
                     <span className="text-[#9AA7B2]">Speed (အမြန်နှုန်း)</span>
-                    <span className="text-[#3ED6B5] font-bold">{ttsRate >= 0 ? `+${ttsRate}%` : `${ttsRate}%`}</span>
+                    <span className="text-[#3ED6B5] font-bold">
+                      {ttsRate >= 0 ? `+${ttsRate}%` : `${ttsRate}%`}
+                      <span className="text-[10px] text-[#9AA7B2] ml-1 font-normal">
+                        ({(1 + ttsRate / 100).toFixed(2)}x)
+                      </span>
+                    </span>
                   </div>
                   <input
                     type="range"
                     min={-50}
-                    max={50}
+                    max={100}
                     step={5}
                     value={ttsRate}
                     onChange={(e) => setTtsRate(Number(e.target.value))}
@@ -1298,9 +1865,16 @@ export default function App() {
                       className="cursor-pointer hover:text-[#3ED6B5]"
                       title="Reset to 1.0x Normal"
                     >
-                      1.0x (Normal)
+                      1.0x
                     </span>
-                    <span>1.5x</span>
+                    <span
+                      onClick={() => setTtsRate(60)}
+                      className="cursor-pointer hover:text-[#3ED6B5]"
+                      title="Story Fast 1.6x"
+                    >
+                      1.6x
+                    </span>
+                    <span>2.0x</span>
                   </div>
                 </div>
 
@@ -1391,8 +1965,8 @@ export default function App() {
               </button>
 
               {/* Sample phrases */}
-              <div className="flex items-center gap-2 text-xs">
-                <span className="text-[#5C6672] font-['JetBrains_Mono'] text-[11px]">စမ်းသပ်ရန် စာသား:</span>
+              <div className="flex items-center gap-2 text-xs flex-wrap">
+                <span className="text-[#5C6672] font-['JetBrains_Mono'] text-[11px]">စမ်းသပ်ရန်:</span>
                 <button
                   type="button"
                   onClick={() => {
@@ -1407,11 +1981,13 @@ export default function App() {
                   type="button"
                   onClick={() => {
                     setTtsSourceMode('custom');
-                    setCustomTtsText('သီဟနှင့် နီလာ အသံဖိုင်ကို စမ်းသပ်နားထောင်ခြင်း ဖြစ်ပါသည်။ ကျေးဇူးတင်ပါသည်။');
+                    setTtsVoice('it-IT-GiuseppeMultilingualNeural');
+                    setTtsRate(30);
+                    setCustomTtsText('ဟိုင်း သူငယ်ချင်းတို့ရေ၊ မောင်ကျော်သူ Fast Vibe အသံနဲ့ ပျော်ရွှင်စွာ နားဆင်လိုက်ရအောင်နော်!');
                   }}
-                  className="px-2 py-1 rounded bg-[#1B222B] text-[#9AA7B2] hover:text-[#3ED6B5] text-[11px] font-['Noto_Sans_Myanmar'] cursor-pointer border border-[#2A323C]"
+                  className="px-2 py-1 rounded bg-[#3ED6B5]/10 text-[#3ED6B5] hover:bg-[#3ED6B5]/20 text-[11px] font-['Noto_Sans_Myanmar'] cursor-pointer border border-[#3ED6B5]/30 font-medium"
                 >
-                  "သီဟနှင့် နီလာ…"
+                  ⚡ "မောင်ကျော်သူ Fast Vibe…"
                 </button>
               </div>
             </div>
@@ -1423,7 +1999,7 @@ export default function App() {
                   <div className="flex items-center gap-2">
                     <span className="w-2 h-2 rounded-full bg-[#3ED6B5] animate-ping" />
                     <span className="font-['Space_Grotesk'] text-sm font-semibold text-[#EDF2F5]">
-                      {ttsVoice === 'my-MM-NilarNeural' ? 'နီလာ (Nilar)' : ttsVoice === 'my-MM-ThihaNeural' ? 'သီဟ (Thiha)' : ttsVoice} — Edge TTS အသံဖိုင် အဆင်သင့်ဖြစ်ပါပြီ
+                      {PRIMARY_VOICES.find((v) => v.id === ttsVoice)?.name || ttsVoice} — Edge TTS အသံဖိုင် အဆင်သင့်ဖြစ်ပါပြီ
                     </span>
                   </div>
                   <span className="font-['JetBrains_Mono'] text-[11px] text-[#3ED6B5] bg-[#3ED6B5]/10 px-2 py-0.5 rounded">
@@ -1467,7 +2043,257 @@ export default function App() {
                     <Download className="w-4 h-4" />
                     Download MP3 (ဒေါင်းလုဒ်)
                   </button>
+
+                  {/* Download Burmese 2-line SRT Button */}
+                  <button
+                    onClick={() => {
+                      if (currentTtsSrt) {
+                        handleDownloadSrt(currentTtsSrt, 'subtitles_burmese_2lines.srt');
+                        return;
+                      }
+                      const durMs = audioDuration ? audioDuration * 1000 : undefined;
+                      const textUsed = ttsSourceMode === 'transcript' ? segments.map((s) => s.translated || s.text).filter(Boolean).join(' ') : customTtsText;
+                      const srtText = generateBurmeseTwoLineSrt(
+                        [],
+                        textUsed,
+                        durMs
+                      );
+                      handleDownloadSrt(srtText, 'subtitles_burmese_2lines.srt');
+                    }}
+                    className="w-full sm:w-auto bg-[#1B222B] hover:bg-[#F2A93B] text-[#F2A93B] hover:text-[#2E1D06] border border-[#F2A93B]/50 font-['Space_Grotesk'] font-semibold text-xs px-4 py-2.5 rounded-lg flex items-center justify-center gap-2 transition cursor-pointer shrink-0"
+                    title="Download 2-line Burmese subtitles (.srt) synchronized with audio"
+                  >
+                    <Subtitles className="w-4 h-4" />
+                    Download .SRT (အချိန်ကိုက် ၂ ကြောင်း)
+                  </button>
                 </div>
+              </div>
+            )}
+          </div>
+        </section>
+
+        {/* ===== CH.07 — GENERATION & TRANSLATION HISTORY ===== */}
+        <section id="ch-07-history" className="bg-[#141920] border border-[#2A323C] rounded-lg mb-6 overflow-hidden shadow-lg">
+          <div className="flex flex-wrap items-center justify-between gap-3 px-5 py-4 border-b border-[#2A323C] bg-gradient-to-b from-white/[0.03] to-transparent">
+            <div className="flex items-center gap-3">
+              <span className="font-['JetBrains_Mono'] text-[11px] font-bold px-2 py-0.5 rounded bg-[#3ED6B5] text-[#0B0E11]">
+                CH.07
+              </span>
+              <div className="flex items-center gap-2 font-['Space_Grotesk'] font-semibold text-[15px] text-[#EDF2F5]">
+                <History className="w-4 h-4 text-[#3ED6B5]" />
+                History &amp; Saved Audio (ထုတ်ယူထားသော အသံဖိုင်နှင့် ဘာသာပြန် မှတ်တမ်းများ)
+              </div>
+              <span className="font-['JetBrains_Mono'] text-[11px] px-2 py-0.5 rounded-full bg-[#3ED6B5]/15 text-[#3ED6B5] border border-[#3ED6B5]/30 font-semibold">
+                {history.length} ခု
+              </span>
+            </div>
+
+            {history.length > 0 && (
+              <div className="flex items-center gap-2">
+                {confirmClearHistory ? (
+                  <div className="flex items-center gap-1.5 bg-[#E8604C]/15 border border-[#E8604C] px-2.5 py-1 rounded animate-in fade-in duration-200">
+                    <span className="text-[11px] font-['Space_Grotesk'] text-[#F5B8AD] font-medium">
+                      မှတ်တမ်းအားလုံး ဖျက်မည်လား?
+                    </span>
+                    <button
+                      onClick={handleClearAllHistory}
+                      className="text-[11px] font-bold font-['Space_Grotesk'] bg-[#E8604C] hover:bg-[#E8604C]/90 text-white px-2.5 py-0.5 rounded cursor-pointer transition shadow-sm"
+                    >
+                      ဖျက်မည် (Confirm)
+                    </button>
+                    <button
+                      onClick={() => setConfirmClearHistory(false)}
+                      className="text-[11px] font-['Space_Grotesk'] bg-[#2A323C] hover:bg-[#3A4553] text-[#EDF2F5] px-2 py-0.5 rounded cursor-pointer transition"
+                    >
+                      မဖျက်ပါ (Cancel)
+                    </button>
+                  </div>
+                ) : (
+                  <button
+                    onClick={() => setConfirmClearHistory(true)}
+                    className="text-xs font-['JetBrains_Mono'] text-[#E8604C] hover:bg-[#E8604C]/10 px-2.5 py-1 rounded transition flex items-center gap-1.5 cursor-pointer border border-[#E8604C]/30"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                    <span>Clear All (မှတ်တမ်းအားလုံးဖျက်မည်)</span>
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+
+          <div className="p-5">
+            {/* History Search & Filter */}
+            {history.length > 0 && (
+              <div className="mb-4 relative">
+                <Search className="w-4 h-4 text-[#5C6672] absolute left-3 top-1/2 -translate-y-1/2" />
+                <input
+                  type="text"
+                  value={historySearch}
+                  onChange={(e) => setHistorySearch(e.target.value)}
+                  placeholder="မှတ်တမ်းများထဲမှ စာသား၊ အသံနာမည် သို့မဟုတ် ဘာသာစကားဖြင့် ရှာဖွေပါ…"
+                  className="w-full bg-[#0B0E11] border border-[#2A323C] text-[#EDF2F5] pl-9 pr-4 py-2 rounded-lg text-xs font-['JetBrains_Mono'] focus:border-[#3ED6B5] outline-none transition"
+                />
+              </div>
+            )}
+
+            {filteredHistory.length === 0 ? (
+              <div className="text-center py-10 text-[#5C6672] space-y-2">
+                <Clock className="w-8 h-8 text-[#5C6672]/60 mx-auto" />
+                <div className="font-['Space_Grotesk'] text-sm text-[#9AA7B2]">
+                  {historySearch ? 'ရှာဖွေမှုနှင့် ကိုက်ညီသော မှတ်တမ်းမရှိပါ' : 'မှတ်တမ်း မရှိသေးပါ'}
+                </div>
+                <p className="text-xs font-['JetBrains_Mono']">
+                  CH.05 တွင် ဘာသာပြန်ခြင်း သို့မဟုတ် CH.06 တွင် အသံဖိုင် ထုတ်ယူသည့်အခါ ဤနေရာတွင် အလိုအလျောက် သိမ်းဆည်းပေးမည် ဖြစ်ပါသည်။
+                </p>
+              </div>
+            ) : (
+              <div className="space-y-4">
+                {filteredHistory.map((item) => {
+                  const isItemPlaying = activeHistoryAudioId === item.id && isHistPlaying;
+
+                  return (
+                    <div
+                      key={item.id}
+                      className="bg-[#0B0E11] border border-[#2A323C] hover:border-[#3ED6B5]/50 rounded-xl p-4 sm:p-5 transition space-y-3.5 shadow-sm"
+                    >
+                      {/* Item Header */}
+                      <div className="flex flex-wrap items-center justify-between gap-2 pb-2.5 border-b border-[#2A323C]/60 text-xs">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="font-['JetBrains_Mono'] text-[11px] text-[#9AA7B2] flex items-center gap-1">
+                            <Clock className="w-3 h-3 text-[#3ED6B5]" />
+                            {item.formattedTime}
+                          </span>
+
+                          <span className="font-['Space_Grotesk'] text-[11px] px-2 py-0.5 rounded bg-[#3ED6B5]/15 text-[#3ED6B5] font-semibold border border-[#3ED6B5]/30">
+                            {item.voiceName}
+                          </span>
+
+                          <span className="font-['JetBrains_Mono'] text-[11px] px-2 py-0.5 rounded bg-[#1B222B] text-[#EDF2F5] border border-[#2A323C]">
+                            {item.targetLang}
+                          </span>
+
+                          {item.speed !== 0 && (
+                            <span className="font-['JetBrains_Mono'] text-[10px] px-1.5 py-0.5 rounded bg-[#F2A93B]/15 text-[#F2A93B]">
+                              Speed {item.speed >= 0 ? `+${item.speed}%` : `${item.speed}%`}
+                            </span>
+                          )}
+                        </div>
+
+                        <div className="flex items-center gap-2">
+                          <button
+                            onClick={() => handleLoadHistoryToEditor(item)}
+                            className="text-xs font-['Space_Grotesk'] text-[#9AA7B2] hover:text-[#3ED6B5] flex items-center gap-1 transition cursor-pointer"
+                            title="Load into Editor"
+                          >
+                            <RotateCcw className="w-3 h-3" />
+                            <span>Load into Editor (အပေါ်သို့ တင်မည်)</span>
+                          </button>
+
+                          <button
+                            onClick={() => handleDeleteHistoryItem(item.id)}
+                            className="text-[#5C6672] hover:text-[#E8604C] transition p-1 cursor-pointer"
+                            title="Delete this record"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      </div>
+
+                      {/* Source Text (if exists) */}
+                      {item.sourceText && (
+                        <div className="bg-[#141920]/80 rounded-lg p-3 border border-[#2A323C]/50">
+                          <div className="text-[10px] font-['JetBrains_Mono'] text-[#5C6672] uppercase tracking-wider mb-1">
+                            မူရင်းစာသား (Original Text)
+                          </div>
+                          <div className="text-xs text-[#9AA7B2] font-['JetBrains_Mono'] leading-relaxed line-clamp-3">
+                            {item.sourceText}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Translated Text */}
+                      <div className="bg-[#141920] rounded-lg p-3.5 border border-[#3ED6B5]/30">
+                        <div className="flex items-center justify-between text-[10px] font-['JetBrains_Mono'] text-[#3ED6B5] uppercase tracking-wider mb-1.5 font-semibold">
+                          <span>ဘာသာပြန်စာသား (Translated Content)</span>
+                          <span className="text-[#5C6672] font-normal">
+                            {item.translatedText.length} characters
+                          </span>
+                        </div>
+                        <div className="text-[13px] sm:text-sm text-[#EDF2F5] font-['Noto_Sans_Myanmar'] leading-relaxed">
+                          {item.translatedText}
+                        </div>
+                      </div>
+
+                      {/* History Audio Player & Action Toolbar */}
+                      <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
+                        {/* Audio Controls */}
+                        <div className="flex items-center gap-3">
+                          <button
+                            onClick={() => handlePlayHistoryAudio(item)}
+                            className={`px-3.5 py-1.5 rounded-lg flex items-center gap-2 text-xs font-['Space_Grotesk'] font-bold transition cursor-pointer shadow ${
+                              isItemPlaying
+                                ? 'bg-[#E8604C] text-white animate-pulse'
+                                : 'bg-[#3ED6B5] hover:bg-[#3ED6B5]/90 text-[#0B0E11]'
+                            }`}
+                          >
+                            {isItemPlaying ? (
+                              <>
+                                <Pause className="w-3.5 h-3.5 fill-current" />
+                                <span>ခေတ္တရပ်မည် (Pause)</span>
+                              </>
+                            ) : (
+                              <>
+                                <Play className="w-3.5 h-3.5 fill-current" />
+                                <span>အသံနားထောင်မည် (Play Audio)</span>
+                              </>
+                            )}
+                          </button>
+
+                          <button
+                            onClick={() => handleDownloadHistoryAudio(item)}
+                            className="bg-[#1B222B] hover:bg-[#2A323C] text-[#3ED6B5] border border-[#2A323C] px-3 py-1.5 rounded-lg text-xs font-['Space_Grotesk'] flex items-center gap-1.5 transition cursor-pointer"
+                          >
+                            <Download className="w-3.5 h-3.5" />
+                            <span>Download MP3</span>
+                          </button>
+
+                          {/* Download Burmese 2-line SRT from History */}
+                          <button
+                            onClick={() => {
+                              const srtContent = item.srtContent || generateBurmeseTwoLineSrt([], item.translatedText);
+                              handleDownloadSrt(srtContent, `subtitles_${item.id}.srt`);
+                            }}
+                            className="bg-[#1B222B] hover:bg-[#F2A93B]/20 text-[#F2A93B] border border-[#F2A93B]/40 hover:border-[#F2A93B] px-3 py-1.5 rounded-lg text-xs font-['Space_Grotesk'] flex items-center gap-1.5 transition cursor-pointer"
+                            title="Download 2-line Burmese subtitles (.srt)"
+                          >
+                            <Subtitles className="w-3.5 h-3.5" />
+                            <span>Download .SRT (မြန်မာ ၂ ကြောင်း)</span>
+                          </button>
+                        </div>
+
+                        {/* Copy Translated Text Button */}
+                        <div className="flex items-center gap-2">
+                          <button
+                            onClick={() => handleCopyHistoryText(item.translatedText, item.id)}
+                            className="text-xs font-['Space_Grotesk'] text-[#9AA7B2] hover:text-[#3ED6B5] bg-[#141920] border border-[#2A323C] px-3 py-1.5 rounded-lg flex items-center gap-1.5 transition cursor-pointer"
+                          >
+                            {copiedHistId === item.id ? (
+                              <>
+                                <Check className="w-3.5 h-3.5 text-[#3ED6B5]" />
+                                <span className="text-[#3ED6B5]">Copied ✓</span>
+                              </>
+                            ) : (
+                              <>
+                                <Copy className="w-3.5 h-3.5" />
+                                <span>Copy Text (စာသားကူးယူရန်)</span>
+                              </>
+                            )}
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
             )}
           </div>
@@ -1510,7 +2336,7 @@ export default function App() {
         </section>
 
         <footer className="text-center mt-9 font-['JetBrains_Mono'] text-[11px] text-[#5C6672]">
-          SIGNAL PATH · TRANSLATE TOOL &amp; EDGE TTS CONSOLE
+          SIGNAL PATH · TRANSLATE TOOL &amp; EDGE TTS CONSOLE · VERSION 3.0
         </footer>
       </div>
     </div>

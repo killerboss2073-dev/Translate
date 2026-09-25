@@ -4,6 +4,89 @@ const TRUSTED_CLIENT_TOKEN = '6A5AA1D4EAFF4E9FB37E23D68491D6F4';
 const CHROMIUM_FULL_VERSION = '143.0.3650.75';
 const SEC_MS_GEC_VERSION = `1-${CHROMIUM_FULL_VERSION}`;
 
+const BURMESE_DIGITS = ['၀', '၁', '၂', '၃', '၄', '၅', '၆', '၇', '၈', '၉'];
+const DIGIT_MAP: Record<string, string> = {
+  '0': '0', '1': '1', '2': '2', '3': '3', '4': '4',
+  '5': '5', '6': '6', '7': '7', '8': '8', '9': '9',
+  '၀': '0', '၁': '1', '၂': '2', '၃': '3', '၄': '4',
+  '၅': '5', '၆': '6', '၇': '7', '၈': '8', '၉': '9',
+};
+
+function toBurmeseDigits(numStr: number | string): string {
+  return String(numStr).split('').map((c) => (c >= '0' && c <= '9' ? BURMESE_DIGITS[Number(c)] : c)).join('');
+}
+
+function normalizeToStandardDigits(str: string): string {
+  return String(str).replace(/[၀-၉]/g, (d) => DIGIT_MAP[d] || d).replace(/,/g, '').trim();
+}
+
+function numberToBurmeseSpoken(num: number | string): string | null {
+  if (typeof num === 'string') {
+    num = Number(normalizeToStandardDigits(num));
+  }
+  if (isNaN(num) || num < 0 || !Number.isInteger(num)) return null;
+  if (num === 0) return '၀';
+
+  const parts: string[] = [];
+  let n = num;
+
+  const than = Math.floor(n / 1000000);
+  if (than > 0) {
+    parts.push(toBurmeseDigits(than) + ' သန်း');
+    n %= 1000000;
+  }
+
+  const thein = Math.floor(n / 100000);
+  if (thein > 0) {
+    parts.push(toBurmeseDigits(thein) + ' သိန်း');
+    n %= 100000;
+  }
+
+  const thaung = Math.floor(n / 10000);
+  if (thaung > 0) {
+    parts.push(toBurmeseDigits(thaung) + ' သောင်း');
+    n %= 10000;
+  }
+
+  const htaung = Math.floor(n / 1000);
+  if (htaung > 0) {
+    parts.push(toBurmeseDigits(htaung) + ' ထောင်');
+    n %= 1000;
+  }
+
+  const yar = Math.floor(n / 100);
+  if (yar > 0) {
+    parts.push(toBurmeseDigits(yar) + ' ရာ');
+    n %= 100;
+  }
+
+  const sel = Math.floor(n / 10);
+  if (sel > 0) {
+    parts.push(toBurmeseDigits(sel) + ' ဆယ်');
+    n %= 10;
+  }
+
+  if (n > 0) {
+    parts.push(toBurmeseDigits(n));
+  }
+
+  return parts.join(' ');
+}
+
+function convertNumbersInTextToBurmese(text: string): string {
+  if (!text) return text;
+  return text.replace(/(?:\b|\s|^|[^\w\d])([0-9၀-၉]{1,3}(?:,[0-9၀-၉]{3})+|[0-9၀-၉]{2,})(?=\b|\s|$|[^\w\d])/gu, (match, numGroup) => {
+    const rawVal = Number(normalizeToStandardDigits(numGroup));
+    if (!isNaN(rawVal) && rawVal >= 10) {
+      const spoken = numberToBurmeseSpoken(rawVal);
+      if (spoken) {
+        return match.replace(numGroup, spoken);
+      }
+    }
+    return match;
+  });
+}
+
 async function generateSecMsGec(): Promise<string> {
   let ticks = Date.now() / 1000;
   ticks += WIN_EPOCH;
@@ -70,8 +153,9 @@ export const onRequestPost = async (context: any) => {
       `Content-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n{"context":{"synthesis":{"audio":{"metadataoptions":{"sentenceBoundaryEnabled":"false","wordBoundaryEnabled":"false"},"outputFormat":"audio-24khz-48kbitrate-mono-mp3"}}}}`
     );
 
-    const safeText = text
-      .trim()
+    const textToSynthesize = convertNumbersInTextToBurmese(text.trim());
+
+    const safeText = textToSynthesize
       .replace(/&/g, '&amp;')
       .replace(/</g, '&lt;')
       .replace(/>/g, '&gt;')
